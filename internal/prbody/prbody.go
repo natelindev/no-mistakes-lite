@@ -69,6 +69,15 @@ func steps(b *strings.Builder, title string, steps []StepSummary, fallback strin
 		detail := strings.TrimSpace(step.Detail)
 		if detail == "" {
 			fmt.Fprintf(b, "- %s: %s\n", name, step.Status)
+		} else if strings.Contains(detail, "\n") {
+			fmt.Fprintf(b, "- %s: %s\n", name, step.Status)
+			for _, line := range strings.Split(detail, "\n") {
+				line = strings.TrimRight(line, " \t\r")
+				if strings.TrimSpace(line) == "" {
+					continue
+				}
+				fmt.Fprintf(b, "  %s\n", line)
+			}
 		} else {
 			fmt.Fprintf(b, "- %s: %s - %s\n", name, step.Status, detail)
 		}

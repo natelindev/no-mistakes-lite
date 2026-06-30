@@ -33,9 +33,9 @@ preflight -> intent -> commit -> worktree -> review -> test -> docs -> lint -> p
 - Dirty work is staged and committed first.
 - Intent is stored before agent fixes mutate the change.
 - A treehouse lease provides the isolated review worktree.
-- Review uses exact `LGTM` or Markdown findings.
-- Tests, docs, lint, CI, and deploy can ask the configured agent for fixes.
-- Auto-merge only runs when `--auto-merge` is passed for that run.
+- Review uses exact `LGTM` or Markdown findings. PR bodies include the actual review findings for every non-LGTM round.
+- Tests, docs, lint, CI, and deploy can ask the configured agent for fixes. PR bodies summarize only each command and final status, not full command output.
+- Auto-merge means nml runs `gh pr merge` after checks pass. It does not use GitHub's repository-level auto-merge feature.
 
 ## Resuming runs
 
@@ -56,12 +56,30 @@ nml resume --run <id>
 When review finds issues, answer the saved gate:
 
 ```sh
+nml tui --run <id>
 nml findings --run <id> --format toon
 nml findings --run <id> --full
+nml respond --action fix --run <id>
 nml respond --action fix --findings r1,r2 --run <id>
 nml respond --action approve --run <id>
 nml respond --action skip --run <id>
 ```
+
+The TUI review gate lets humans approve, skip, fix all findings, or choose exact findings with space and enter. In headless mode, finding IDs are `r1`, `r2`, and so on; `nml respond --action fix --run <id>` fixes all latest findings when `--findings` is omitted.
+
+## Persistent settings
+
+Persist run defaults globally or for the current project. Project settings override global settings. Project identity is based on Git's common directory, so worktrees for the same repository share settings.
+
+```sh
+nml config --interactive
+nml config --scope project --set review.yolo=true --set ci.timeout=15m
+nml config --scope project --set auto_merge.enabled=true --set auto_merge.method=squash
+nml config --scope global --set review.yolo=false --set ci.timeout=30m
+nml config --format toon
+```
+
+`nml config --interactive` starts with a scope picker, then prompts for yolo review fixing, auto-merge, merge method, CI timeout, test command, and lint command. Supported non-interactive keys are `review.yolo`, `auto_merge.enabled`, `auto_merge.method`, `ci.timeout`, `commands.test`, and `commands.lint`. CLI flags still override persisted defaults for that invocation.
 
 ## Agent integrations
 
@@ -79,4 +97,4 @@ nml tui
 nml tui --run <id>
 ```
 
-The explicit TUI command shows the saved run timeline with the same `◆`, `◇`, `│`, `◻`, and `└` prompt style. Long-running operations show progress on stderr with the current step, such as `review round 1`, `running test`, `pushing review branch`, or `watching CI`. Running and fixing steps animate with spinner frames. Press `q`, `esc`, `ctrl+c`, or `ctrl+d` to quit where shown.
+The explicit TUI command shows the saved run timeline with the same `◆`, `◇`, `│`, `◻`, and `└` prompt style. If the saved run is waiting at a review gate, it opens an interactive response picker instead. Long-running operations show progress on stderr with the current step, such as `review round 1`, `running test`, `pushing review branch`, or `watching CI`. Running and fixing steps animate with spinner frames. Press `q`, `esc`, `ctrl+c`, or `ctrl+d` to quit where shown.

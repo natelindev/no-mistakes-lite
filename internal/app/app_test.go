@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/natelindev/no-mistakes-lite/internal/config"
+	"github.com/natelindev/no-mistakes-lite/internal/review"
 	"github.com/natelindev/no-mistakes-lite/internal/runstate"
 )
 
@@ -120,6 +121,60 @@ func TestHooksInstallWritesUserIntegrations(t *testing.T) {
 	}
 }
 
+func TestConfigInteractiveRequiresTerminal(t *testing.T) {
+	var out, errw bytes.Buffer
+	app := App{Out: &out, Err: &errw, Cwd: t.TempDir(), Interactive: false}
+	code := app.Run(context.Background(), []string{"config", "--interactive"})
+	if code != ExitUsage {
+		t.Fatalf("expected usage exit, got %d", code)
+	}
+	if !strings.Contains(out.String(), "--interactive requires a terminal") {
+		t.Fatalf("unexpected output: %q", out.String())
+	}
+}
+
+func TestConfigSetPersistsProjectSettings(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	repo := newAppTestRepo(t, filepath.Join(t.TempDir(), "repo"))
+	var out, errw bytes.Buffer
+	app := App{Out: &out, Err: &errw, Cwd: repo, Interactive: false}
+	code := app.Run(context.Background(), []string{"config", "--scope", "project", "--set", "review.yolo=true", "--set", "ci.timeout=15m", "--set", "auto_merge.enabled=true"})
+	if code != ExitOK {
+		t.Fatalf("expected exit 0, got %d\nstdout:\n%s\nstderr:\n%s", code, out.String(), errw.String())
+	}
+	out.Reset()
+	code = app.Run(context.Background(), []string{"config"})
+	if code != ExitOK {
+		t.Fatalf("expected config exit 0, got %d", code)
+	}
+	text := out.String()
+	for _, want := range []string{"review.yolo,\"true\"", "ci.timeout,15m", "auto_merge.enabled,\"true\""} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("config output missing %q in:\n%s", want, text)
+		}
+	}
+}
+
+func TestConfigSetPersistsGlobalSettings(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	var out, errw bytes.Buffer
+	app := App{Out: &out, Err: &errw, Cwd: t.TempDir(), Interactive: false}
+	code := app.Run(context.Background(), []string{"config", "--scope", "global", "--set", "auto_merge.enabled=true"})
+	if code != ExitOK {
+		t.Fatalf("expected exit 0, got %d\nstdout:\n%s\nstderr:\n%s", code, out.String(), errw.String())
+	}
+	out.Reset()
+	code = app.Run(context.Background(), []string{"config"})
+	if code != ExitOK {
+		t.Fatalf("expected config exit 0, got %d", code)
+	}
+	if !strings.Contains(out.String(), "auto_merge.enabled,\"true\"") {
+		t.Fatalf("config output missing global auto merge setting:\n%s", out.String())
+	}
+}
+
 func TestPromptWizardContextCancelCancels(t *testing.T) {
 	var errw bytes.Buffer
 	ctx, cancel := context.WithCancel(context.Background())
@@ -205,6 +260,30 @@ func TestCommitDirtyOrHeadChangedDetectsAgentCommit(t *testing.T) {
 	}
 	if !changed {
 		t.Fatal("expected helper to detect clean worktree with a new agent commit")
+	}
+}
+
+func TestPRBodyListsReviewFindingsAndConciseCommands(t *testing.T) {
+	state := runstate.New("/tmp/repo", "feature/source", "main", "origin", "abc", "origin/main")
+	state.ReviewBranch = "nml/test"
+	state.Tests = []runstate.CommandRun{{Command: "bun test", Status: runstate.StatusCompleted, Detail: "bun test | very long output"}}
+	state.Lint = []runstate.CommandRun{{Command: "bun biome check --write", Status: runstate.StatusCompleted, Detail: "bun biome check --write | fixed 18 files"}}
+	for i := range state.Steps {
+		if state.Steps[i].Name == "review" {
+			state.Steps[i].Rounds = []runstate.ReviewRound{
+				{Number: 1, Result: "findings", Findings: []review.Finding{{ID: "r1", Severity: review.SeverityWarning, File: "app.tsx", Line: 42, Description: "fix fallback identity"}}},
+				{Number: 2, Result: "LGTM"},
+			}
+		}
+	}
+	body := prBody(&state, "owner/repo")
+	for _, want := range []string{"- Round 1: findings with 1 findings", "  - `r1` WARNING `app.tsx:42` - fix fallback identity", "- Round 2: LGTM", "- Test: completed - bun test", "- Lint: completed - bun biome check --write"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("PR body missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "very long output") || strings.Contains(body, "fixed 18 files") {
+		t.Fatalf("PR body should not include verbose command output:\n%s", body)
 	}
 }
 

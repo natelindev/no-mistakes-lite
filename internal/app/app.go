@@ -147,10 +147,12 @@ func (a App) home(ctx context.Context) int {
 type runOptions struct {
 	Yes              bool
 	Yolo             bool
+	YoloSet          bool
 	Message          string
 	MessageFromAgent bool
 	Paths            []string
 	AutoMerge        bool
+	AutoMergeSet     bool
 	MergeMethod      string
 	SkipDocs         bool
 	SkipDeploy       bool
@@ -172,6 +174,43 @@ func (s *stringList) Set(v string) error {
 	return nil
 }
 
+type repeatString []string
+
+func (s *repeatString) String() string { return strings.Join(*s, ",") }
+func (s *repeatString) Set(v string) error {
+	v = strings.TrimSpace(v)
+	if v != "" {
+		*s = append(*s, v)
+	}
+	return nil
+}
+
+func flagWasSet(fs *flag.FlagSet, name string) bool {
+	seen := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			seen = true
+		}
+	})
+	return seen
+}
+
+func applyPersistentRunOptions(cfg config.Config, opts *runOptions) {
+	if !opts.YoloSet {
+		opts.Yolo = cfg.Review.Yolo
+	}
+	if !opts.AutoMergeSet {
+		opts.AutoMerge = cfg.AutoMerge.Enabled
+	}
+}
+
+func autoMergeEnabled(cfg config.Config, opts runOptions) bool {
+	if opts.AutoMergeSet {
+		return opts.AutoMerge
+	}
+	return cfg.AutoMerge.Enabled
+}
+
 func (a App) run(ctx context.Context, args []string) int {
 	var paths stringList
 	opts := runOptions{}
@@ -182,7 +221,7 @@ func (a App) run(ctx context.Context, args []string) int {
 	fs.StringVar(&opts.Message, "message", "", "commit message for dirty worktree")
 	fs.BoolVar(&opts.MessageFromAgent, "message-from-agent", false, "ask the configured agent to generate a commit message")
 	fs.Var(&paths, "paths", "comma-separated path list to stage instead of all changes")
-	fs.BoolVar(&opts.AutoMerge, "auto-merge", false, "enable auto-merge for this run only")
+	fs.BoolVar(&opts.AutoMerge, "auto-merge", false, "enable auto-merge for this run")
 	fs.StringVar(&opts.MergeMethod, "merge-method", "", "merge method: squash, merge, or rebase")
 	fs.BoolVar(&opts.SkipDocs, "skip-docs", false, "skip docs step for this run")
 	fs.BoolVar(&opts.SkipDeploy, "skip-deploy", false, "skip deploy step for this run")
@@ -198,6 +237,8 @@ func (a App) run(ctx context.Context, args []string) int {
 		return ExitUsage
 	}
 	opts.Paths = paths
+	opts.YoloSet = flagWasSet(fs, "yolo")
+	opts.AutoMergeSet = flagWasSet(fs, "auto-merge")
 	if opts.MergeMethod != "" && !config.ValidMergeMethod(opts.MergeMethod) {
 		toon.Error(a.Out, "invalid --merge-method: "+opts.MergeMethod, []string{"Use one of: squash, merge, rebase."})
 		return ExitUsage
@@ -217,6 +258,7 @@ func (a App) run(ctx context.Context, args []string) int {
 		toon.Error(a.Out, err.Error(), nil)
 		return ExitError
 	}
+	applyPersistentRunOptions(cfg, &opts)
 	state, err := gitx.Inspect(ctx, first.RepoRoot, cfg.Remote, cfg.MainBranch, opts.Fetch)
 	if err != nil {
 		toon.Error(a.Out, err.Error(), nil)
@@ -315,7 +357,7 @@ func (a App) run(ctx context.Context, args []string) int {
 	}
 	run.ReviewBranch = uniqueReviewBranchName(reviewBranchName(run.CommitMessage, state.Branch, run.SourceHead), run.ID)
 	run.SetStep("worktree", runstate.StatusRunning, "leasing treehouse worktree")
-	prep, err := a.prepareWorktree(ctx, client, treehousePath, &run)
+	prep, err := a.prepareWorktree(ctx, cfg, client, treehousePath, &run)
 	if err != nil {
 		run.SetStep("worktree", runstate.StatusFailed, redact.Secrets(err.Error()))
 		path, saveErr := saveRun(ctx, client, run)
@@ -527,7 +569,7 @@ type worktreePrep struct {
 	Method      string
 }
 
-func (a App) prepareWorktree(ctx context.Context, source gitx.Client, treehousePath string, run *runstate.State) (worktreePrep, error) {
+func (a App) prepareWorktree(ctx context.Context, cfg config.Config, source gitx.Client, treehousePath string, run *runstate.State) (worktreePrep, error) {
 	th := treehouse.New(treehousePath, run.RepoRoot)
 	var worktreePath string
 	err := a.withSpinner(ctx, "leasing treehouse worktree", func() error {
@@ -577,11 +619,71 @@ func (a App) prepareWorktree(ctx context.Context, source gitx.Client, treehouseP
 			return worktreePrep{Path: worktreePath, CommitCount: len(commits)}, fmt.Errorf("cherry-pick failed and format-patch produced no patch")
 		}
 		if amErr := a.withSpinner(ctx, "applying patch fallback", func() error { return target.ApplyMailbox(ctx, patch) }); amErr != nil {
-			target.AMAbort(ctx)
-			return worktreePrep{Path: worktreePath, CommitCount: len(commits)}, fmt.Errorf("cherry-pick failed and patch fallback failed: %w", amErr)
+			a.warn("patch fallback has conflicts, trying agent conflict resolution: %v", amErr)
+			if resolveErr := a.fixMailboxConflicts(ctx, cfg, run, amErr); resolveErr != nil {
+				target.AMAbort(ctx)
+				return worktreePrep{Path: worktreePath, CommitCount: len(commits)}, fmt.Errorf("cherry-pick failed and patch fallback conflict resolution failed: %w", resolveErr)
+			}
+			return worktreePrep{Path: worktreePath, CommitCount: len(commits), Method: "format-patch+conflict-fix"}, nil
 		}
 		return worktreePrep{Path: worktreePath, CommitCount: len(commits), Method: "format-patch"}, nil
 	}
+}
+
+func (a App) fixMailboxConflicts(ctx context.Context, cfg config.Config, run *runstate.State, applyErr error) error {
+	if cfg.Agent.Name == "" {
+		return fmt.Errorf("merge conflicts require a configured agent: %w", applyErr)
+	}
+	pathOverride := ""
+	if cfg.Agent.PathOverrides != nil {
+		pathOverride = strings.TrimSpace(cfg.Agent.PathOverrides[cfg.Agent.Name])
+	}
+	runner, err := agent.New(cfg.Agent.Name, pathOverride)
+	if err != nil {
+		return err
+	}
+	client := gitx.Client{Dir: run.WorktreePath}
+	for attempt := 1; attempt <= 5; attempt++ {
+		status, _ := client.StatusPorcelain(ctx)
+		prompt := fmt.Sprintf(`Resolve the current git apply/am merge conflicts in this worktree.
+
+Original user intent:
+%s
+
+Apply error:
+%s
+
+Git status:
+%s
+
+Rules:
+- Resolve conflicts by preserving the original user intent and current base branch behavior.
+- Do not broaden scope.
+- Do not run git am --continue or commit. nml will continue the mailbox after you resolve files.
+- Leave all resolved files in the worktree.`, run.Intent, applyErr.Error(), status)
+		_, err := a.withSpinnerAgent(ctx, fmt.Sprintf("resolving merge conflicts (attempt %d)", attempt), func() (agent.Response, error) {
+			return runner.Run(ctx, agent.Request{
+				CWD:          run.WorktreePath,
+				SystemPrompt: mutatingAgentSystemPrompt(),
+				Prompt:       prompt,
+				Expect:       agent.ExpectText,
+				Model:        cfg.Agent.Model,
+				ExtraArgs:    cfg.Agent.ExtraArgs,
+			})
+		})
+		if err != nil {
+			return err
+		}
+		if err := client.Add(ctx, nil); err != nil {
+			return err
+		}
+		if _, err := client.Run(ctx, "am", "--continue"); err == nil {
+			return nil
+		} else {
+			applyErr = err
+		}
+	}
+	return fmt.Errorf("merge conflicts were not resolved after 5 attempts: %w", applyErr)
 }
 
 type reviewOutcome struct {
@@ -1081,6 +1183,7 @@ func commandDetail(command, output string) string {
 }
 
 func (a App) runPushAndPR(ctx context.Context, cfg config.Config, opts runOptions, run *runstate.State) error {
+	autoMerge := autoMergeEnabled(cfg, opts)
 	client := gitx.Client{Dir: run.WorktreePath}
 	remoteURL, err := client.RemoteURL(ctx, run.Remote)
 	if err != nil || strings.TrimSpace(remoteURL) == "" {
@@ -1089,7 +1192,7 @@ func (a App) runPushAndPR(ctx context.Context, cfg config.Config, opts runOption
 		run.SetStep("pr", runstate.StatusSkipped, detail)
 		run.SetStep("ci", runstate.StatusSkipped, "CI requires a pushed GitHub PR")
 		run.SetStep("deploy", runstate.StatusSkipped, "deploy waits for CI in a later stage")
-		if opts.AutoMerge {
+		if autoMerge {
 			run.SetStep("final", runstate.StatusFailed, "--auto-merge requires a GitHub PR")
 			return fmt.Errorf("--auto-merge requires a pushed GitHub PR")
 		}
@@ -1103,7 +1206,7 @@ func (a App) runPushAndPR(ctx context.Context, cfg config.Config, opts runOption
 		run.SetStep("pr", runstate.StatusSkipped, detail)
 		run.SetStep("ci", runstate.StatusSkipped, "CI requires a GitHub PR")
 		run.SetStep("deploy", runstate.StatusSkipped, "deploy waits for CI in a later stage")
-		if opts.AutoMerge {
+		if autoMerge {
 			run.SetStep("final", runstate.StatusFailed, "--auto-merge requires a GitHub PR")
 			return fmt.Errorf("--auto-merge requires a GitHub PR")
 		}
@@ -1126,7 +1229,7 @@ func (a App) runPushAndPR(ctx context.Context, cfg config.Config, opts runOption
 		run.SetStep("pr", runstate.StatusSkipped, "gh is not installed; branch was pushed")
 		run.SetStep("ci", runstate.StatusSkipped, "CI watch requires gh")
 		run.SetStep("deploy", runstate.StatusSkipped, "deploy waits for CI in a later stage")
-		if opts.AutoMerge {
+		if autoMerge {
 			run.SetStep("final", runstate.StatusFailed, "--auto-merge requires gh and a GitHub PR")
 			return fmt.Errorf("--auto-merge requires gh and a GitHub PR")
 		}
@@ -1137,7 +1240,7 @@ func (a App) runPushAndPR(ctx context.Context, cfg config.Config, opts runOption
 		run.SetStep("pr", runstate.StatusSkipped, "gh auth status failed; branch was pushed")
 		run.SetStep("ci", runstate.StatusSkipped, "CI watch requires gh auth")
 		run.SetStep("deploy", runstate.StatusSkipped, "deploy waits for CI in a later stage")
-		if opts.AutoMerge {
+		if autoMerge {
 			run.SetStep("final", runstate.StatusFailed, "--auto-merge requires gh auth and a GitHub PR")
 			return fmt.Errorf("--auto-merge requires gh auth and a GitHub PR")
 		}
@@ -1178,11 +1281,11 @@ func (a App) runPushAndPR(ctx context.Context, cfg config.Config, opts runOption
 		run.SetStep("deploy", runstate.StatusSkipped, "skipped by --skip-deploy")
 	} else if !cfg.Deploy.Enabled || strings.TrimSpace(cfg.Deploy.Command) == "" {
 		run.SetStep("deploy", runstate.StatusSkipped, "deploy disabled or missing command")
-	} else if cfg.Deploy.When == "after_merge" && !opts.AutoMerge {
-		run.SetStep("deploy", runstate.StatusSkipped, "configured for after_merge and --auto-merge was not passed")
+	} else if cfg.Deploy.When == "after_merge" && !autoMerge {
+		run.SetStep("deploy", runstate.StatusSkipped, "configured for after_merge and auto-merge is disabled")
 	}
-	if opts.AutoMerge {
-		if err := a.withSpinner(ctx, "enabling auto-merge", func() error { return runAutoMerge(ctx, ghPath, run, cfg, opts) }); err != nil {
+	if autoMerge {
+		if err := a.withSpinner(ctx, "merging PR", func() error { return runAutoMerge(ctx, ghPath, run, cfg, opts) }); err != nil {
 			run.SetStep("final", runstate.StatusFailed, err.Error())
 			return err
 		}
@@ -1367,6 +1470,9 @@ func shouldRunDeploy(cfg config.Config, opts runOptions, when string) bool {
 	if opts.SkipDeploy || !cfg.Deploy.Enabled || strings.TrimSpace(cfg.Deploy.Command) == "" {
 		return false
 	}
+	if when == "after_merge" && !autoMergeEnabled(cfg, opts) {
+		return false
+	}
 	configured := strings.TrimSpace(cfg.Deploy.When)
 	if configured == "" {
 		configured = "after_ci"
@@ -1487,12 +1593,12 @@ func runAutoMerge(ctx context.Context, ghPath string, run *runstate.State, cfg c
 	case "rebase":
 		flag = "--rebase"
 	}
-	run.SetStep("final", runstate.StatusRunning, "enabling auto-merge with method "+method)
-	out, err := runGH(ctx, ghPath, run.WorktreePath, "pr", "merge", run.PRURL, flag, "--auto")
+	run.SetStep("final", runstate.StatusRunning, "merging PR with method "+method)
+	out, err := runGH(ctx, ghPath, run.WorktreePath, "pr", "merge", run.PRURL, flag)
 	if err != nil {
-		return fmt.Errorf("auto-merge failed: %w: %s", err, out)
+		return fmt.Errorf("PR merge failed: %w: %s", err, out)
 	}
-	run.SetStep("final", runstate.StatusRunning, "auto-merge enabled with method "+method)
+	run.SetStep("final", runstate.StatusRunning, "merged PR with method "+method)
 	return nil
 }
 
@@ -1600,11 +1706,13 @@ func prBody(run *runstate.State, ownerRepo string) string {
 			continue
 		}
 		for _, round := range step.Rounds {
-			detail := round.Result
+			status := round.Result
+			detail := ""
 			if len(round.Findings) > 0 {
-				detail = fmt.Sprintf("%s with %d findings", round.Result, len(round.Findings))
+				status = fmt.Sprintf("%s with %d findings", round.Result, len(round.Findings))
+				detail = reviewFindingsMarkdown(round.Findings)
 			}
-			reviewSteps = append(reviewSteps, prbody.StepSummary{Name: fmt.Sprintf("Round %d", round.Number), Status: detail})
+			reviewSteps = append(reviewSteps, prbody.StepSummary{Name: fmt.Sprintf("Round %d", round.Number), Status: status, Detail: detail})
 		}
 	}
 	return prbody.Generate(prbody.Input{
@@ -1621,9 +1729,42 @@ func prBody(run *runstate.State, ownerRepo string) string {
 func commandSummaries(name string, runs []runstate.CommandRun) []prbody.StepSummary {
 	out := make([]prbody.StepSummary, 0, len(runs))
 	for _, run := range runs {
-		out = append(out, prbody.StepSummary{Name: name, Status: string(run.Status), Detail: run.Detail})
+		out = append(out, prbody.StepSummary{Name: name, Status: string(run.Status), Detail: commandOnly(run)})
 	}
 	return out
+}
+
+func commandOnly(run runstate.CommandRun) string {
+	command := strings.TrimSpace(run.Command)
+	if command != "" {
+		return command
+	}
+	detail := strings.TrimSpace(run.Detail)
+	if before, _, ok := strings.Cut(detail, " | "); ok {
+		return strings.TrimSpace(before)
+	}
+	return detail
+}
+
+func reviewFindingsMarkdown(findings []review.Finding) string {
+	var b strings.Builder
+	b.WriteString("Findings:\n")
+	for _, finding := range findings {
+		severity := strings.ToUpper(string(finding.Severity))
+		if severity == "" {
+			severity = "UNKNOWN"
+		}
+		location := finding.File
+		if finding.Line > 0 {
+			location += fmt.Sprintf(":%d", finding.Line)
+		}
+		id := strings.TrimSpace(finding.ID)
+		if id == "" {
+			id = "finding"
+		}
+		fmt.Fprintf(&b, "- `%s` %s `%s` - %s\n", id, severity, location, strings.TrimSpace(finding.Description))
+	}
+	return strings.TrimSpace(b.String())
 }
 
 func stepSummaries(run *runstate.State, name string) []prbody.StepSummary {
@@ -1874,6 +2015,9 @@ func (a App) init(ctx context.Context, args []string) int {
 		{"remote", cfg.Remote},
 		{"test", testCmd},
 		{"lint", cfg.Commands.Lint},
+		{"review.yolo", fmt.Sprint(cfg.Review.Yolo)},
+		{"ci.timeout", cfg.CI.Timeout},
+		{"auto_merge.enabled", fmt.Sprint(cfg.AutoMerge.Enabled)},
 		{"auto_merge.method", cfg.AutoMerge.Method},
 	})
 	return ExitOK
@@ -1953,10 +2097,16 @@ func (a App) doctor(ctx context.Context, args []string) int {
 func (a App) config(ctx context.Context, args []string) int {
 	format := "toon"
 	setTestCommand := ""
+	scope := "project"
+	interactiveConfig := false
+	var setValues repeatString
 	fs := flag.NewFlagSet("config", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.StringVar(&format, "format", "toon", "output format: toon or yaml")
+	fs.BoolVar(&interactiveConfig, "interactive", false, "use interactive setup prompts")
 	fs.StringVar(&setTestCommand, "set-test-command", "", "save a per-repo test command")
+	fs.StringVar(&scope, "scope", "project", "settings scope for --set: project or global")
+	fs.Var(&setValues, "set", "persist KEY=VALUE; repeat for multiple settings")
 	if hasHelp(args) {
 		printConfigHelp(a.Out)
 		return ExitOK
@@ -1974,6 +2124,46 @@ func (a App) config(ctx context.Context, args []string) int {
 	if err != nil {
 		toon.Error(a.Out, err.Error(), nil)
 		return ExitError
+	}
+	if interactiveConfig {
+		if !a.Interactive {
+			toon.Error(a.Out, "--interactive requires a terminal", []string{"Use `nml config --scope project --set KEY=VALUE` from a non-interactive shell."})
+			return ExitUsage
+		}
+		return a.configInteractive(ctx, repoRoot)
+	}
+	if len(setValues) > 0 {
+		if scope != "project" && scope != "global" {
+			toon.Error(a.Out, "invalid --scope: "+scope, []string{"Use `--scope project` or `--scope global`."})
+			return ExitUsage
+		}
+		settings := map[string]string{}
+		for _, item := range setValues {
+			key, value, ok := strings.Cut(item, "=")
+			if !ok || strings.TrimSpace(key) == "" {
+				toon.Error(a.Out, "--set must be KEY=VALUE", []string{"Example: nml config --scope project --set review.yolo=true --set ci.timeout=15m"})
+				return ExitUsage
+			}
+			settings[strings.TrimSpace(key)] = strings.TrimSpace(value)
+		}
+		if scope == "project" && repoRoot == "" {
+			toon.Error(a.Out, "project-scoped settings require a git repository", []string{"Use `--scope global` or cd into a repository."})
+			return ExitUsage
+		}
+		path, err := config.SaveScopedSettings(repoRoot, scope, settings)
+		if err != nil {
+			toon.Error(a.Out, err.Error(), nil)
+			return ExitError
+		}
+		toon.KV(a.Out, "config", "saved")
+		toon.KV(a.Out, "scope", scope)
+		toon.KV(a.Out, "path", path)
+		rows := make([]toon.Row, 0, len(settings))
+		for key, value := range settings {
+			rows = append(rows, toon.Row{key, value})
+		}
+		toon.Table(a.Out, "settings", []string{"key", "value"}, rows)
+		return ExitOK
 	}
 	if setTestCommand != "" {
 		if repoRoot == "" {
@@ -2008,12 +2198,84 @@ func (a App) config(ctx context.Context, args []string) int {
 			{"test", cfg.Commands.Test},
 			{"lint", cfg.Commands.Lint},
 			{"review.rounds", fmt.Sprint(cfg.Review.Rounds)},
+			{"review.yolo", fmt.Sprint(cfg.Review.Yolo)},
 			{"ci.timeout", cfg.CI.Timeout},
+			{"auto_merge.enabled", fmt.Sprint(cfg.AutoMerge.Enabled)},
+			{"auto_merge.method", cfg.AutoMerge.Method},
 		})
 	default:
 		toon.Error(a.Out, "invalid --format: "+format, []string{"Use `--format yaml` or `--format toon`."})
 		return ExitUsage
 	}
+	return ExitOK
+}
+
+func (a App) configInteractive(ctx context.Context, repoRoot string) int {
+	scope, cancelled := a.promptChoice(ctx, "Configuration scope", "project", []string{"project", "global"})
+	if cancelled {
+		return a.setupCancelled()
+	}
+	if scope == "project" && repoRoot == "" {
+		toon.Error(a.Out, "project-scoped settings require a git repository", []string{"Choose global scope, or cd into a repository and rerun `nml config --interactive`."})
+		return ExitUsage
+	}
+	loadRoot := repoRoot
+	if scope == "global" {
+		loadRoot = ""
+	}
+	cfg, _, err := config.Load(loadRoot)
+	if err != nil {
+		toon.Error(a.Out, err.Error(), nil)
+		return ExitError
+	}
+	yolo, cancelled := a.promptChoice(ctx, "Yolo mode (auto-fix review findings)", fmt.Sprint(cfg.Review.Yolo), []string{"false", "true"})
+	if cancelled {
+		return a.setupCancelled()
+	}
+	autoMerge, cancelled := a.promptChoice(ctx, "Enable auto-merge", fmt.Sprint(cfg.AutoMerge.Enabled), []string{"false", "true"})
+	if cancelled {
+		return a.setupCancelled()
+	}
+	mergeMethod, cancelled := a.promptChoice(ctx, "Auto-merge method", cfg.AutoMerge.Method, []string{"squash", "merge", "rebase"})
+	if cancelled {
+		return a.setupCancelled()
+	}
+	ciTimeout, cancelled := a.promptWizard(ctx, "CI timeout", cfg.CI.Timeout)
+	if cancelled {
+		return a.setupCancelled()
+	}
+	testCommand, cancelled := a.promptWizard(ctx, "Test command", cfg.Commands.Test)
+	if cancelled {
+		return a.setupCancelled()
+	}
+	lintCommand, cancelled := a.promptWizard(ctx, "Lint command", cfg.Commands.Lint)
+	if cancelled {
+		return a.setupCancelled()
+	}
+	settings := map[string]string{
+		"review.yolo":        yolo,
+		"auto_merge.enabled": autoMerge,
+		"auto_merge.method":  mergeMethod,
+		"ci.timeout":         ciTimeout,
+		"commands.test":      testCommand,
+		"commands.lint":      lintCommand,
+	}
+	path, err := config.SaveScopedSettings(repoRoot, scope, settings)
+	if err != nil {
+		toon.Error(a.Out, err.Error(), nil)
+		return ExitError
+	}
+	toon.KV(a.Out, "config", "saved")
+	toon.KV(a.Out, "scope", scope)
+	toon.KV(a.Out, "path", path)
+	toon.Table(a.Out, "settings", []string{"key", "value"}, []toon.Row{
+		{"review.yolo", yolo},
+		{"auto_merge.enabled", autoMerge},
+		{"auto_merge.method", mergeMethod},
+		{"ci.timeout", ciTimeout},
+		{"commands.test", testCommand},
+		{"commands.lint", lintCommand},
+	})
 	return ExitOK
 }
 
@@ -2063,9 +2325,12 @@ func (a App) tui(ctx context.Context, args []string) int {
 		toon.Error(a.Out, "tui requires an interactive terminal", []string{"Use `nml status --format toon` in headless mode."})
 		return ExitUsage
 	}
-	_, state, code := a.loadRun(ctx, runRef)
+	path, state, code := a.loadRun(ctx, runRef)
 	if code != ExitOK {
 		return code
+	}
+	if stepStatus(state, "review") == runstate.StatusAwaitingUser {
+		return a.reviewGateTUI(ctx, path, state)
 	}
 	if err := tui.ShowRun(ctx, a.Out, state); err != nil {
 		toon.Error(a.Out, err.Error(), nil)
@@ -2200,6 +2465,7 @@ func (a App) resume(ctx context.Context, args []string) int {
 	fs.BoolVar(&opts.Yolo, "yolo", false, "auto-fix all actionable review findings")
 	fs.BoolVar(&opts.SkipDocs, "skip-docs", false, "skip docs for this resume")
 	fs.BoolVar(&opts.SkipDeploy, "skip-deploy", false, "skip deploy for this resume")
+	fs.BoolVar(&opts.AutoMerge, "auto-merge", false, "enable auto-merge for this resume")
 	fs.StringVar(&opts.CITimeout, "ci-timeout", "", "CI timeout for this resume")
 	fs.StringVar(&opts.TestCommand, "test-command", "", "test command for this resume only")
 	if hasHelp(args) {
@@ -2210,6 +2476,8 @@ func (a App) resume(ctx context.Context, args []string) int {
 		toon.Error(a.Out, err.Error(), []string{"Run `nml resume --help` for usage."})
 		return ExitUsage
 	}
+	opts.YoloSet = flagWasSet(fs, "yolo")
+	opts.AutoMergeSet = flagWasSet(fs, "auto-merge")
 	if fs.NArg() > 0 {
 		toon.Error(a.Out, "resume does not accept positional arguments", []string{"Run `nml resume --run <id>` or `nml resume`."})
 		return ExitUsage
@@ -2276,10 +2544,6 @@ func (a App) continueRun(ctx context.Context, options cfgLoadOptions, state runs
 		toon.List(a.Out, "help", []string{"Run is already completed.", "Run `nml run` to start a new validation run when the repository has new changes."})
 		return ExitOK
 	}
-	if reviewStatus := stepStatus(state, "review"); reviewStatus == runstate.StatusAwaitingUser {
-		printReviewGate(a.Out, state, options.StatePath, latestReviewFindings(state))
-		return ExitOK
-	}
 	if strings.TrimSpace(state.RepoRoot) == "" || strings.TrimSpace(state.WorktreePath) == "" {
 		toon.Error(a.Out, "run state is missing repo or worktree path", []string{"Inspect with `nml status --run " + state.ID + "`."})
 		return ExitError
@@ -2292,6 +2556,11 @@ func (a App) continueRun(ctx context.Context, options cfgLoadOptions, state runs
 	if err != nil {
 		toon.Error(a.Out, err.Error(), nil)
 		return ExitError
+	}
+	applyPersistentRunOptions(cfg, &options.RunOptions)
+	if reviewStatus := stepStatus(state, "review"); reviewStatus == runstate.StatusAwaitingUser && !options.RunOptions.Yolo {
+		printReviewGate(a.Out, state, options.StatePath, latestReviewFindings(state))
+		return ExitOK
 	}
 	client := gitx.Client{Dir: state.RepoRoot}
 	a.beginPipelineProgress()
@@ -2366,6 +2635,63 @@ func (a App) respond(ctx context.Context, args []string) int {
 	if code != ExitOK {
 		return code
 	}
+	var selected []review.Finding
+	if action == "fix" {
+		selected = selectFindings(latestReviewFindings(state), findingList)
+		if len(selected) == 0 {
+			toon.Error(a.Out, "no findings selected", []string{"Pass `--findings r1,r2` using ids from `nml findings`."})
+			return ExitUsage
+		}
+	}
+	return a.applyReviewGateResponse(ctx, path, state, action, selected)
+}
+
+func (a App) reviewGateTUI(ctx context.Context, path string, state runstate.State) int {
+	findings := latestReviewFindings(state)
+	if len(findings) == 0 {
+		printReviewGate(a.Out, state, path, findings)
+		return ExitOK
+	}
+	options := []tui.Option{
+		{Label: "Fix all findings", Description: "Run the configured agent against every current finding."},
+		{Label: "Choose findings", Description: "Select one or more findings before running the fixer."},
+		{Label: "Approve review", Description: "Accept the current review findings and continue validation."},
+		{Label: "Skip review", Description: "Mark review as skipped and continue validation."},
+	}
+	idx, cancelled, err := tui.SelectOne(ctx, a.In, a.Out, "Review gate response", options, 0)
+	if err != nil {
+		toon.Error(a.Out, err.Error(), nil)
+		return ExitError
+	}
+	if cancelled {
+		printReviewGate(a.Out, state, path, findings)
+		return ExitOK
+	}
+	switch idx {
+	case 0:
+		return a.applyReviewGateResponse(ctx, path, state, "fix", selectFindings(findings, ""))
+	case 1:
+		selected, cancelled, err := tui.SelectFindings(ctx, a.In, a.Out, "Select findings to fix", findings)
+		if err != nil {
+			toon.Error(a.Out, err.Error(), nil)
+			return ExitError
+		}
+		if cancelled {
+			printReviewGate(a.Out, state, path, findings)
+			return ExitOK
+		}
+		return a.applyReviewGateResponse(ctx, path, state, "fix", selected)
+	case 2:
+		return a.applyReviewGateResponse(ctx, path, state, "approve", nil)
+	case 3:
+		return a.applyReviewGateResponse(ctx, path, state, "skip", nil)
+	default:
+		printReviewGate(a.Out, state, path, findings)
+		return ExitOK
+	}
+}
+
+func (a App) applyReviewGateResponse(ctx context.Context, path string, state runstate.State, action string, selected []review.Finding) int {
 	cfg, _, err := config.Load(state.RepoRoot)
 	if err != nil {
 		toon.Error(a.Out, err.Error(), nil)
@@ -2379,14 +2705,14 @@ func (a App) respond(ctx context.Context, args []string) int {
 			progressStarted = true
 		}
 	}
-	if action == "approve" {
+	switch action {
+	case "approve":
 		state.SetStep("review", runstate.StatusCompleted, "approved by user")
-	} else if action == "skip" {
+	case "skip":
 		state.SetStep("review", runstate.StatusSkipped, "skipped by user")
-	} else {
-		selected := selectFindings(latestReviewFindings(state), findingList)
+	case "fix":
 		if len(selected) == 0 {
-			toon.Error(a.Out, "no findings selected", []string{"Pass `--findings r1,r2` using ids from `nml findings`."})
+			toon.Error(a.Out, "no findings selected", []string{"Select one or more findings, or run `nml respond --action fix` to fix all latest findings."})
 			return ExitUsage
 		}
 		if cfg.Agent.Name == "" {
@@ -2422,6 +2748,9 @@ func (a App) respond(ctx context.Context, args []string) int {
 			printReviewGate(a.Out, state, path, outcome.Findings)
 			return ExitOK
 		}
+	default:
+		toon.Error(a.Out, "invalid review response action: "+action, []string{"Use approve, skip, or fix."})
+		return ExitUsage
 	}
 	startProgress()
 	if err := a.runValidationCommands(ctx, cfg, runOptions{}, &state); err != nil {
@@ -3046,7 +3375,7 @@ func printReviewGate(w io.Writer, state runstate.State, path string, findings []
 		rows = append(rows, toon.Row{finding.ID, string(finding.Severity), finding.File, line, description})
 	}
 	toon.Table(w, "findings", []string{"id", "severity", "file", "line", "description"}, rows)
-	help := []string{"Run `nml respond --action fix --findings <ids> --run " + state.ID + "` to fix selected findings.", "Run `nml respond --action approve --run " + state.ID + "` to accept and continue.", "Run `nml respond --action skip --run " + state.ID + "` to skip review."}
+	help := []string{"Run `nml tui --run " + state.ID + "` to choose approve, skip, or findings to fix interactively.", "Run `nml respond --action fix --run " + state.ID + "` to fix all findings, or add `--findings <ids>` for selected findings.", "Run `nml respond --action approve --run " + state.ID + "` to accept and continue.", "Run `nml respond --action skip --run " + state.ID + "` to skip review."}
 	if truncated {
 		help = append(help, "Run `nml findings --run "+state.ID+" --full` to see complete descriptions.")
 	}
@@ -3475,8 +3804,8 @@ func printRunHelp(w io.Writer) {
 	fmt.Fprintln(w, "  --message-from-agent      request agent-generated commit message (default: false)")
 	fmt.Fprintln(w, "  --paths <a,b>             stage selected paths instead of all changes (default: all)")
 	fmt.Fprintln(w, "  --yes                     accept safe defaults without prompts (default: false)")
-	fmt.Fprintln(w, "  --yolo                    auto-select all actionable findings (default: false)")
-	fmt.Fprintln(w, "  --auto-merge              enable auto-merge for this run only (default: false)")
+	fmt.Fprintln(w, "  --yolo                    auto-select all actionable findings (default: config value)")
+	fmt.Fprintln(w, "  --auto-merge              enable auto-merge for this run (default: config value)")
 	fmt.Fprintln(w, "  --merge-method <method>   squash, merge, or rebase (default: config value)")
 	fmt.Fprintln(w, "  --skip-docs               skip docs for this run (default: false)")
 	fmt.Fprintln(w, "  --skip-deploy             skip deploy for this run (default: false)")
@@ -3519,14 +3848,26 @@ func printDoctorHelp(w io.Writer) {
 
 func printConfigHelp(w io.Writer) {
 	fmt.Fprintln(w, "Usage: nml config [flags]")
-	fmt.Fprintln(w, "Prints merged config or saves a per-repo test command.")
+	fmt.Fprintln(w, "Prints merged config or persists project/global settings.")
 	fmt.Fprintln(w, "Flags:")
 	fmt.Fprintln(w, "  --format <toon|yaml>       output format (default: toon)")
+	fmt.Fprintln(w, "  --interactive              use TUI prompts to pick and save settings (default: false)")
+	fmt.Fprintln(w, "  --scope <project|global>   settings scope for --set (default: project)")
+	fmt.Fprintln(w, "  --set <KEY=VALUE>          persist setting; repeat for multiple settings")
 	fmt.Fprintln(w, "  --set-test-command <cmd>   save a per-repo test command (default: none)")
+	fmt.Fprintln(w, "Settings:")
+	fmt.Fprintln(w, "  review.yolo=true|false")
+	fmt.Fprintln(w, "  auto_merge.enabled=true|false")
+	fmt.Fprintln(w, "  auto_merge.method=squash|merge|rebase")
+	fmt.Fprintln(w, "  ci.timeout=<duration>")
+	fmt.Fprintln(w, "  commands.test=<cmd>")
+	fmt.Fprintln(w, "  commands.lint=<cmd>")
 	fmt.Fprintln(w, "Examples:")
 	fmt.Fprintln(w, "  nml config --format toon")
+	fmt.Fprintln(w, "  nml config --interactive")
+	fmt.Fprintln(w, "  nml config --scope project --set review.yolo=true --set ci.timeout=15m")
+	fmt.Fprintln(w, "  nml config --scope global --set auto_merge.enabled=true")
 	fmt.Fprintln(w, "  nml config --set-test-command \"go test ./...\"")
-	fmt.Fprintln(w, "  nml config --format yaml")
 }
 
 func printStatusHelp(w io.Writer) {
@@ -3557,7 +3898,7 @@ func printFindingsHelp(w io.Writer) {
 
 func printTUIHelp(w io.Writer) {
 	fmt.Fprintln(w, "Usage: nml tui [flags]")
-	fmt.Fprintln(w, "Shows a Bubble Tea timeline for the latest saved run.")
+	fmt.Fprintln(w, "Shows a Bubble Tea timeline for the latest saved run, or answers a review gate interactively.")
 	fmt.Fprintln(w, "Flags:")
 	fmt.Fprintln(w, "  --run <id|path>     run id or path (default: latest in repo)")
 	fmt.Fprintln(w, "Examples:")
@@ -3583,9 +3924,10 @@ func printResumeHelp(w io.Writer) {
 	fmt.Fprintln(w, "Flags:")
 	fmt.Fprintln(w, "  --run <id|path>        resume a specific run (default: latest resumable)")
 	fmt.Fprintln(w, "  --yes                  accept safe defaults without prompts (default: false)")
-	fmt.Fprintln(w, "  --yolo                 auto-fix all actionable review findings (default: false)")
+	fmt.Fprintln(w, "  --yolo                 auto-fix all actionable review findings (default: config value)")
 	fmt.Fprintln(w, "  --skip-docs            skip docs for this resume (default: false)")
 	fmt.Fprintln(w, "  --skip-deploy          skip deploy for this resume (default: false)")
+	fmt.Fprintln(w, "  --auto-merge           enable auto-merge for this resume (default: config value)")
 	fmt.Fprintln(w, "  --ci-timeout <dur>     override CI timeout (default: config value)")
 	fmt.Fprintln(w, "  --test-command <cmd>   override test command for this resume only (default: config value)")
 	fmt.Fprintln(w, "Examples:")

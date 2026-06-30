@@ -6,7 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -35,6 +39,7 @@ type CommitConfig struct {
 
 type ReviewConfig struct {
 	Rounds         int      `yaml:"rounds" json:"rounds"`
+	Yolo           bool     `yaml:"yolo" json:"yolo"`
 	IgnorePatterns []string `yaml:"ignore_patterns" json:"ignore_patterns"`
 }
 
@@ -44,7 +49,8 @@ type CIConfig struct {
 }
 
 type AutoMergeConfig struct {
-	Method string `yaml:"method" json:"method"`
+	Enabled bool   `yaml:"enabled" json:"enabled"`
+	Method  string `yaml:"method" json:"method"`
 }
 
 type DocsConfig struct {
@@ -145,6 +151,7 @@ type RawCommitConfig struct {
 
 type RawReviewConfig struct {
 	Rounds         *int     `yaml:"rounds"`
+	Yolo           *bool    `yaml:"yolo"`
 	IgnorePatterns []string `yaml:"ignore_patterns"`
 }
 
@@ -154,7 +161,8 @@ type RawCIConfig struct {
 }
 
 type RawAutoMergeConfig struct {
-	Method *string `yaml:"method"`
+	Enabled *bool   `yaml:"enabled"`
+	Method  *string `yaml:"method"`
 }
 
 type RawDocsConfig struct {
@@ -179,10 +187,21 @@ func ResolvePaths(repoRoot string) (Paths, error) {
 		GlobalPath: filepath.Join(root, "config.yaml"),
 	}
 	if repoRoot != "" {
-		paths.RepoID = RepoID(repoRoot)
+		paths.RepoID = ProjectID(repoRoot)
+		if paths.RepoID == "" {
+			return paths, fmt.Errorf("project config requires a git repository")
+		}
 		paths.RepoPath = filepath.Join(root, "repos", paths.RepoID+".yaml")
 	}
 	return paths, nil
+}
+
+func ProjectID(repoRoot string) string {
+	commonDir := gitCommonDir(repoRoot)
+	if commonDir == "" {
+		return ""
+	}
+	return hashID("git:" + commonDir)
 }
 
 func RepoID(repoRoot string) string {
@@ -190,8 +209,34 @@ func RepoID(repoRoot string) string {
 	if err == nil {
 		repoRoot = abs
 	}
-	sum := sha256.Sum256([]byte(filepath.Clean(repoRoot)))
+	return hashID("path:" + filepath.Clean(repoRoot))
+}
+
+func hashID(value string) string {
+	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])[:16]
+}
+
+func gitCommonDir(repoRoot string) string {
+	out, err := exec.Command("git", "-C", repoRoot, "rev-parse", "--git-common-dir").Output()
+	if err != nil {
+		return ""
+	}
+	value := strings.TrimSpace(string(out))
+	if value == "" {
+		return ""
+	}
+	if !filepath.IsAbs(value) {
+		value = filepath.Join(repoRoot, value)
+	}
+	abs, err := filepath.Abs(value)
+	if err == nil {
+		value = abs
+	}
+	if realPath, err := filepath.EvalSymlinks(value); err == nil {
+		value = realPath
+	}
+	return filepath.Clean(value)
 }
 
 func Load(repoRoot string) (Config, Paths, error) {
@@ -281,6 +326,9 @@ func Apply(cfg *Config, raw RawConfig) {
 		if raw.Review.Rounds != nil {
 			cfg.Review.Rounds = *raw.Review.Rounds
 		}
+		if raw.Review.Yolo != nil {
+			cfg.Review.Yolo = *raw.Review.Yolo
+		}
 		if raw.Review.IgnorePatterns != nil {
 			cfg.Review.IgnorePatterns = append([]string(nil), raw.Review.IgnorePatterns...)
 		}
@@ -293,8 +341,13 @@ func Apply(cfg *Config, raw RawConfig) {
 			cfg.CI.PollInterval = *raw.CI.PollInterval
 		}
 	}
-	if raw.AutoMerge != nil && raw.AutoMerge.Method != nil {
-		cfg.AutoMerge.Method = *raw.AutoMerge.Method
+	if raw.AutoMerge != nil {
+		if raw.AutoMerge.Enabled != nil {
+			cfg.AutoMerge.Enabled = *raw.AutoMerge.Enabled
+		}
+		if raw.AutoMerge.Method != nil {
+			cfg.AutoMerge.Method = *raw.AutoMerge.Method
+		}
 	}
 	if raw.Docs != nil {
 		if raw.Docs.Enabled != nil {
@@ -333,35 +386,95 @@ func SaveGlobal(cfg Config) (string, error) {
 }
 
 func SaveRepoCommand(repoRoot, name, value string) (string, error) {
+	return SaveScopedSettings(repoRoot, "project", map[string]string{"commands." + name: value})
+}
+
+func SaveScopedSettings(repoRoot, scope string, settings map[string]string) (string, error) {
 	paths, err := ResolvePaths(repoRoot)
 	if err != nil {
 		return "", err
 	}
-	if paths.RepoPath == "" {
-		return "", fmt.Errorf("repo root is required")
+	path := paths.GlobalPath
+	if scope == "project" {
+		if paths.RepoPath == "" {
+			return "", fmt.Errorf("repo root is required")
+		}
+		path = paths.RepoPath
+	} else if scope != "global" {
+		return "", fmt.Errorf("scope must be global or project")
 	}
-	if err := os.MkdirAll(filepath.Dir(paths.RepoPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", err
 	}
 	doc := map[string]any{}
-	if data, err := os.ReadFile(paths.RepoPath); err == nil && len(data) > 0 {
+	if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
 		if err := yaml.Unmarshal(data, &doc); err != nil {
-			return "", fmt.Errorf("parse %s: %w", paths.RepoPath, err)
+			return "", fmt.Errorf("parse %s: %w", path, err)
 		}
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
-	commands, _ := doc["commands"].(map[string]any)
-	if commands == nil {
-		commands = map[string]any{}
+	for key, value := range settings {
+		parsed, canonical, err := parseSetting(key, value)
+		if err != nil {
+			return "", err
+		}
+		setDotted(doc, canonical, parsed)
 	}
-	commands[name] = value
-	doc["commands"] = commands
 	data, err := yaml.Marshal(doc)
 	if err != nil {
 		return "", err
 	}
-	return paths.RepoPath, os.WriteFile(paths.RepoPath, data, 0o600)
+	return path, os.WriteFile(path, data, 0o600)
+}
+
+func parseSetting(key, value string) (any, string, error) {
+	key = strings.TrimSpace(key)
+	value = strings.TrimSpace(value)
+	switch key {
+	case "yolo", "review.yolo":
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return nil, "", fmt.Errorf("%s must be true or false", key)
+		}
+		return parsed, "review.yolo", nil
+	case "auto_merge", "auto_merge.enabled":
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return nil, "", fmt.Errorf("%s must be true or false", key)
+		}
+		return parsed, "auto_merge.enabled", nil
+	case "auto_merge.method":
+		if !ValidMergeMethod(value) {
+			return nil, "", fmt.Errorf("auto_merge.method must be squash, merge, or rebase")
+		}
+		return value, key, nil
+	case "ci.timeout":
+		if _, err := time.ParseDuration(value); err != nil {
+			return nil, "", fmt.Errorf("ci.timeout must be a duration like 15m: %w", err)
+		}
+		return value, key, nil
+	case "test", "commands.test":
+		return value, "commands.test", nil
+	case "lint", "commands.lint":
+		return value, "commands.lint", nil
+	default:
+		return nil, "", fmt.Errorf("unsupported setting %q", key)
+	}
+}
+
+func setDotted(doc map[string]any, key string, value any) {
+	parts := strings.Split(key, ".")
+	current := doc
+	for _, part := range parts[:len(parts)-1] {
+		next, _ := current[part].(map[string]any)
+		if next == nil {
+			next = map[string]any{}
+			current[part] = next
+		}
+		current = next
+	}
+	current[parts[len(parts)-1]] = value
 }
 
 func MarshalYAML(cfg Config) ([]byte, error) {

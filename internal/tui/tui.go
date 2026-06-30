@@ -42,6 +42,16 @@ type selectModel struct {
 	optionStart int
 }
 
+type findingSelectModel struct {
+	title       string
+	findings    []review.Finding
+	cursor      int
+	selected    map[int]bool
+	cancelled   bool
+	submitted   bool
+	optionStart int
+}
+
 type inputModel struct {
 	title        string
 	value        []rune
@@ -180,7 +190,7 @@ func RenderReviewGate(runID, statePath, worktreePath string, findings []review.F
 	b.WriteString(branchStyle.Render("│"))
 	b.WriteString("\n")
 	for _, finding := range findings {
-		line := fmt.Sprintf("│  ◻ %s %s", strings.ToUpper(string(finding.Severity[:1])), finding.File)
+		line := fmt.Sprintf("│  ◻ %s %s %s", finding.ID, severityInitial(finding), finding.File)
 		if finding.Line > 0 {
 			line += fmt.Sprintf(":%d", finding.Line)
 		}
@@ -193,11 +203,20 @@ func RenderReviewGate(runID, statePath, worktreePath string, findings []review.F
 	b.WriteString(activeStyle.Render("◆  Next actions"))
 	b.WriteString("\n")
 	b.WriteString(branchStyle.Render("│"))
+	b.WriteString("  ◻ nml tui --run ")
+	b.WriteString(runID)
+	b.WriteString("  # choose approve, skip, or findings to fix")
+	b.WriteString("\n")
+	b.WriteString(branchStyle.Render("│"))
 	b.WriteString("  ◻ nml respond --action fix --findings <ids> --run ")
 	b.WriteString(runID)
 	b.WriteString("\n")
 	b.WriteString(branchStyle.Render("│"))
 	b.WriteString("  ◻ nml respond --action approve --run ")
+	b.WriteString(runID)
+	b.WriteString("\n")
+	b.WriteString(branchStyle.Render("│"))
+	b.WriteString("  ◻ nml respond --action skip --run ")
 	b.WriteString(runID)
 	b.WriteString("\n")
 	b.WriteString(branchStyle.Render("│"))
@@ -329,6 +348,41 @@ func SelectOne(ctx context.Context, in io.Reader, out io.Writer, title string, o
 	return m.selected, false, nil
 }
 
+func SelectFindings(ctx context.Context, in io.Reader, out io.Writer, title string, findings []review.Finding) ([]review.Finding, bool, error) {
+	if len(findings) == 0 {
+		return nil, false, fmt.Errorf("no findings available")
+	}
+	selected := make(map[int]bool, len(findings))
+	for i := range findings {
+		selected[i] = true
+	}
+	program := tea.NewProgram(findingSelectModel{
+		title:       title,
+		findings:    findings,
+		selected:    selected,
+		optionStart: 2,
+	}, tea.WithInput(in), tea.WithOutput(out), tea.WithContext(ctx), tea.WithMouseCellMotion())
+	final, err := program.Run()
+	if err != nil {
+		return nil, false, err
+	}
+	m, ok := final.(findingSelectModel)
+	if !ok {
+		return nil, false, fmt.Errorf("unexpected finding picker state")
+	}
+	if m.cancelled {
+		return nil, true, nil
+	}
+	var outFindings []review.Finding
+	for i, finding := range m.findings {
+		if m.selected[i] {
+			finding.Selected = true
+			outFindings = append(outFindings, finding)
+		}
+	}
+	return outFindings, false, nil
+}
+
 func Input(ctx context.Context, in io.Reader, out io.Writer, title, defaultValue string) (string, bool, error) {
 	program := tea.NewProgram(inputModel{
 		title:        title,
@@ -387,6 +441,8 @@ func (m model) Init() tea.Cmd {
 }
 
 func (m selectModel) Init() tea.Cmd { return nil }
+
+func (m findingSelectModel) Init() tea.Cmd { return nil }
 
 func (m inputModel) Init() tea.Cmd { return nil }
 
@@ -574,6 +630,88 @@ func (m selectModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m findingSelectModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "ctrl+d", "q", "esc":
+			m.cancelled = true
+			return m, tea.Quit
+		case "up", "k":
+			if m.cursor > 0 {
+				m.cursor--
+			}
+		case "down", "j":
+			if m.cursor < len(m.findings)-1 {
+				m.cursor++
+			}
+		case " ":
+			m.selected[m.cursor] = !m.selected[m.cursor]
+		case "a":
+			m.toggleAll()
+		case "enter":
+			m.submitted = true
+			return m, tea.Quit
+		}
+	case tea.MouseMsg:
+		mouse := tea.MouseEvent(msg)
+		if mouse.Action == tea.MouseActionPress && mouse.Button == tea.MouseButtonLeft {
+			idx := mouse.Y - m.optionStart
+			if idx >= 0 && idx < len(m.findings) {
+				m.cursor = idx
+				m.selected[idx] = !m.selected[idx]
+			}
+		}
+	}
+	return m, nil
+}
+
+func (m findingSelectModel) toggleAll() {
+	allSelected := true
+	for i := range m.findings {
+		if !m.selected[i] {
+			allSelected = false
+			break
+		}
+	}
+	for i := range m.findings {
+		m.selected[i] = !allSelected
+	}
+}
+
+func (m findingSelectModel) View() string {
+	var b strings.Builder
+	b.WriteString(activeStyle.Render("◆  " + m.title + " (space toggles, enter fixes)"))
+	b.WriteString("\n")
+	b.WriteString(branchStyle.Render("│"))
+	b.WriteString("\n")
+	for i, finding := range m.findings {
+		box := "◻"
+		if m.selected[i] {
+			box = "◼"
+		}
+		line := fmt.Sprintf("│  %s %s %s %s", box, finding.ID, severityInitial(finding), finding.File)
+		if finding.Line > 0 {
+			line += fmt.Sprintf(":%d", finding.Line)
+		}
+		if finding.Description != "" {
+			line += mutedStyle.Render("  " + finding.Description)
+		}
+		if i == m.cursor {
+			b.WriteString(selectedStyle.Render(line))
+		} else {
+			b.WriteString(styleForFinding(finding).Render(line))
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString(branchStyle.Render("│"))
+	b.WriteString("\n")
+	b.WriteString(branchStyle.Render("└"))
+	b.WriteString(mutedStyle.Render("  j/k or arrows move, space/click toggle, a toggle all, enter fix, ctrl+c/ctrl+d/q cancel"))
+	b.WriteString("\n")
+	return b.String()
+}
+
 func (m selectModel) View() string {
 	var b strings.Builder
 	b.WriteString(activeStyle.Render("◆  " + m.title + " (space or enter to select)"))
@@ -688,6 +826,14 @@ func statusMarker(status runstate.StepStatus, frame int) string {
 	default:
 		return "◌"
 	}
+}
+
+func severityInitial(finding review.Finding) string {
+	severity := string(finding.Severity)
+	if severity == "" {
+		return "?"
+	}
+	return strings.ToUpper(string(severity[:1]))
 }
 
 func styleForFinding(finding review.Finding) lipgloss.Style {

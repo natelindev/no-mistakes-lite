@@ -17,10 +17,14 @@ nml findings --format toon
 nml findings --run <id> --full
 nml runs --resumable
 nml resume --run <id>
+nml respond --action fix --run <id>      # fix all latest review findings
 nml respond --action approve
 nml config --format toon
+nml config --interactive
+nml config --scope project --set review.yolo=true --set ci.timeout=15m
+nml config --scope global --set auto_merge.enabled=true
 nml hooks install --apps claude,codex,opencode
-nml tui
+nml tui                                 # timeline, or interactive review gate
 ```
 
 Headless commands keep stdout structured and compact. Running `nml` with no arguments is content-first and never prompts. Progress goes to stderr. Exit codes are 0 for success or no-op, 1 for runtime errors, and 2 for usage errors.
@@ -39,7 +43,7 @@ The repository also carries an Agent Skill at `skills/no-mistakes-lite/SKILL.md`
 ## Implemented first
 
 - Go module and `nml` binary skeleton.
-- Global and per-repo config loading from `~/.config/nml`.
+- Global and per-repo config loading from `~/.config/nml`, including persistent run defaults such as yolo review fixing, auto-merge, CI timeout, and validation commands.
 - Git preflight classification and no-op exits.
 - Non-interactive first-run setup with `--yes`, plus an explicit `--interactive` wizard for humans.
 - Doctor command with TOON output.
@@ -51,6 +55,6 @@ The repository also carries an Agent Skill at `skills/no-mistakes-lite/SKILL.md`
 - Docs evaluation and optional agent documentation updates.
 - GitHub remote detection, safe push of tool-owned `nml/*` branches, and GitHub PR create/update through `gh` when available.
 - Bounded CI watch, failed-log collection, persisted CI logs, agent CI fix retries, optional per-run auto-merge, and optional deploy command retries.
-- Resumable failed or interrupted runs via `nml resume`, review finding parser, secret redaction, PR body generation, Bubble Tea run timeline, AXI session hook installation for Claude Code, Codex, and OpenCode, installable Agent Skill copy, install script, usage docs, and unit tests.
+- Resumable failed or interrupted runs via `nml resume`, review finding parser, secret redaction, PR body generation, Bubble Tea run timeline and interactive review gate response picker, AXI session hook installation for Claude Code, Codex, and OpenCode, installable Agent Skill copy, install script, usage docs, and unit tests.
 
-See `docs/usage.md` for workflow details. Future work is mostly provider expansion and richer TUI interactions.
+See `docs/usage.md` for workflow details. Future work is mostly provider expansion.

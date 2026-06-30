@@ -32,6 +32,9 @@ nml findings --format toon
 nml findings --run <id> --full
 nml runs --resumable
 nml resume --run <id>
+nml config --interactive
+nml config --scope project --set review.yolo=true --set ci.timeout=15m
+nml config --scope global --set auto_merge.enabled=true
 nml tui
 ```
 
@@ -40,15 +43,18 @@ Common run flags:
 - `--paths <a,b>` stages selected paths only.
 - `--yes` accepts safe defaults without prompts.
 - `--yolo` auto-selects all actionable findings. Use only with explicit user consent.
-- `--auto-merge` enables auto-merge for that run only. Use only with explicit user consent.
+- `--auto-merge` makes nml run `gh pr merge` after checks pass. It does not use GitHub's repository-level auto-merge feature. Use only with explicit user consent.
 - `--skip-docs`, `--skip-deploy`, `--ci-timeout <duration>`, `--merge-method <squash|merge|rebase>`, and `--fetch <bool>` tune the run.
+- Persist defaults with `nml config --interactive`, `nml config --scope project --set review.yolo=true --set ci.timeout=15m`, or `nml config --scope global --set auto_merge.enabled=true`. Project settings override global settings.
 
 ## Review gates
 
 When `nml` parks at a review gate, inspect findings and respond:
 
 ```sh
+nml tui --run <id>
 nml findings --format toon
+nml respond --action fix --run <id>
 nml respond --action fix --findings r1,r2 --run <id>
 nml respond --action approve --run <id>
 nml respond --action skip --run <id>
@@ -56,7 +62,8 @@ nml respond --action skip --run <id>
 
 Guidelines:
 
-- Use `respond --action fix` for clear, mechanical findings.
+- Use `nml tui --run <id>` when a human wants to choose approve, skip, fix all, or specific findings interactively.
+- Use `respond --action fix` for clear, mechanical findings. Omitting `--findings` fixes all latest findings.
 - Ask the user before approving, skipping, or fixing anything that changes product behavior or conflicts with stated intent.
 - While a saved gate is active, prefer `nml respond` over manual edits. If the run ends as failed or cancelled, fix the problem, then start a fresh run or resume if `nml runs --resumable` shows it.
 - Use `--full` when output says long fields were truncated.

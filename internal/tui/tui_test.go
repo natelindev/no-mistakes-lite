@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/natelindev/no-mistakes-lite/internal/review"
 	"github.com/natelindev/no-mistakes-lite/internal/runstate"
 )
 
@@ -57,6 +58,61 @@ func TestSelectModelCtrlDCancel(t *testing.T) {
 	m = updated.(selectModel)
 	if !m.cancelled {
 		t.Fatal("expected cancelled")
+	}
+}
+
+func TestFindingSelectModelTogglesFinding(t *testing.T) {
+	m := findingSelectModel{
+		findings: []review.Finding{
+			{ID: "r1", Severity: review.SeverityWarning, File: "a.go"},
+			{ID: "r2", Severity: review.SeverityError, File: "b.go"},
+		},
+		selected:    map[int]bool{0: true, 1: true},
+		optionStart: 2,
+	}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(findingSelectModel)
+	if m.cursor != 1 {
+		t.Fatalf("cursor = %d, want 1", m.cursor)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = updated.(findingSelectModel)
+	if m.selected[1] {
+		t.Fatalf("second finding should be deselected")
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(findingSelectModel)
+	if !m.submitted || m.cancelled {
+		t.Fatalf("submitted = %v cancelled = %v, want true false", m.submitted, m.cancelled)
+	}
+}
+
+func TestFindingSelectModelToggleAll(t *testing.T) {
+	m := findingSelectModel{
+		findings: []review.Finding{{ID: "r1"}, {ID: "r2"}},
+		selected: map[int]bool{0: true, 1: true},
+	}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	m = updated.(findingSelectModel)
+	if m.selected[0] || m.selected[1] {
+		t.Fatalf("toggle all should deselect every finding")
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	m = updated.(findingSelectModel)
+	if !m.selected[0] || !m.selected[1] {
+		t.Fatalf("toggle all should select every finding")
+	}
+}
+
+func TestRenderReviewGateShowsFindingIDs(t *testing.T) {
+	got := stripANSI(RenderReviewGate("run1", "/tmp/state.json", "/tmp/wt", []review.Finding{
+		{ID: "r1", Severity: review.SeverityWarning, File: "app.go", Line: 12, Description: "fix me"},
+	}))
+	if !strings.Contains(got, "◻ r1 W app.go:12  fix me") {
+		t.Fatalf("review gate should show finding id, got:\n%s", got)
+	}
+	if !strings.Contains(got, "nml tui --run run1") {
+		t.Fatalf("review gate should suggest interactive TUI, got:\n%s", got)
 	}
 }
 
