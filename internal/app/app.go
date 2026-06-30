@@ -1738,7 +1738,7 @@ func createOrUpdatePR(ctx context.Context, ghPath, cwd, base, branch, title, bod
 	if err := bodyFile.Close(); err != nil {
 		return "", err
 	}
-	if url, err := runGH(ctx, ghPath, cwd, "pr", "view", "--head", branch, "--json", "url", "--jq", ".url"); err == nil && strings.TrimSpace(url) != "" {
+	if url, err := runGH(ctx, ghPath, cwd, "pr", "view", branch, "--json", "url", "--jq", ".url"); err == nil && strings.TrimSpace(url) != "" {
 		prURL := strings.TrimSpace(url)
 		if _, err := runGH(ctx, ghPath, cwd, "pr", "edit", prURL, "--title", title, "--body-file", bodyFile.Name()); err != nil {
 			return "", err

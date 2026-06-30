@@ -211,6 +211,41 @@ func TestParseGitHubRemote(t *testing.T) {
 	}
 }
 
+func TestCreateOrUpdatePRViewsExistingBranch(t *testing.T) {
+	dir := t.TempDir()
+	fakeGH := filepath.Join(dir, "gh")
+	script := `#!/bin/sh
+set -eu
+case "${1:-} ${2:-}" in
+  "pr view")
+    test "${3:-}" = "nml/test-branch"
+    echo "https://github.com/owner/repo/pull/7"
+    ;;
+  "pr edit")
+    test "${3:-}" = "https://github.com/owner/repo/pull/7"
+    ;;
+  "pr create")
+    echo "pr create should not run when an existing PR is found" >&2
+    exit 2
+    ;;
+  *)
+    echo "unexpected gh command: $*" >&2
+    exit 2
+    ;;
+esac
+`
+	if err := os.WriteFile(fakeGH, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	url, err := createOrUpdatePR(context.Background(), fakeGH, dir, "main", "nml/test-branch", "title", "body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if url != "https://github.com/owner/repo/pull/7" {
+		t.Fatalf("url = %q", url)
+	}
+}
+
 func TestRunPreparesTreehouseWorktreeForCleanFeatureBranch(t *testing.T) {
 	root := t.TempDir()
 	home := filepath.Join(root, "home")
