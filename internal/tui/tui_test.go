@@ -1,0 +1,125 @@
+package tui
+
+import (
+	"regexp"
+	"strings"
+	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/natelindev/no-mistakes-lite/internal/runstate"
+)
+
+func TestSelectModelSpaceSelectsCursor(t *testing.T) {
+	m := selectModel{
+		options:     []Option{{Label: "pi"}, {Label: "codex"}},
+		cursor:      0,
+		selected:    0,
+		optionStart: 2,
+	}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(selectModel)
+	if m.cursor != 1 {
+		t.Fatalf("cursor = %d, want 1", m.cursor)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = updated.(selectModel)
+	if m.selected != 1 || m.cancelled {
+		t.Fatalf("selected = %d cancelled = %v, want 1 false", m.selected, m.cancelled)
+	}
+}
+
+func TestSelectModelMouseClickSelectsRow(t *testing.T) {
+	m := selectModel{
+		options:     []Option{{Label: "squash"}, {Label: "merge"}, {Label: "rebase"}},
+		cursor:      0,
+		selected:    0,
+		optionStart: 2,
+	}
+	updated, _ := m.Update(tea.MouseMsg(tea.MouseEvent{X: 3, Y: 4, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft}))
+	m = updated.(selectModel)
+	if m.cursor != 2 || m.selected != 2 || m.cancelled {
+		t.Fatalf("cursor = %d selected = %d cancelled = %v, want 2 2 false", m.cursor, m.selected, m.cancelled)
+	}
+}
+
+func TestSelectModelCancel(t *testing.T) {
+	m := selectModel{options: []Option{{Label: "pi"}}, optionStart: 2}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(selectModel)
+	if !m.cancelled {
+		t.Fatal("expected cancelled")
+	}
+}
+
+func TestSelectModelCtrlDCancel(t *testing.T) {
+	m := selectModel{options: []Option{{Label: "pi"}}, optionStart: 2}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	m = updated.(selectModel)
+	if !m.cancelled {
+		t.Fatal("expected cancelled")
+	}
+}
+
+func TestInputModelAcceptsTypedValue(t *testing.T) {
+	m := inputModel{defaultValue: "main"}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("develop")})
+	m = updated.(inputModel)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(inputModel)
+	if string(m.value) != "develop" || !m.submitted || m.cancelled {
+		t.Fatalf("value = %q submitted = %v cancelled = %v", string(m.value), m.submitted, m.cancelled)
+	}
+}
+
+func TestInputModelCtrlDCancel(t *testing.T) {
+	m := inputModel{defaultValue: "main"}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	m = updated.(inputModel)
+	if !m.cancelled {
+		t.Fatal("expected cancelled")
+	}
+}
+
+func TestRenderProgressStepIsLeftAligned(t *testing.T) {
+	got := stripANSI(RenderProgressStep(runstate.StatusCompleted, "checking documentation", 0))
+	want := "◇  checking documentation\n│\n"
+	if got != want {
+		t.Fatalf("progress step = %q, want %q", got, want)
+	}
+	if strings.Contains(got, "│  ◇") {
+		t.Fatalf("progress step should not indent marker under branch line: %q", got)
+	}
+}
+
+func TestTimelineSpacesStepsWithBranchLine(t *testing.T) {
+	m := model{state: runstate.State{Steps: []runstate.Step{
+		{Name: "test", Status: runstate.StatusCompleted, Detail: "passed"},
+		{Name: "docs", Status: runstate.StatusRunning, Detail: "checking"},
+	}}}
+	got := stripANSI(m.timeline())
+	if !strings.HasPrefix(got, "◇  test") {
+		t.Fatalf("timeline should start with left aligned step marker, got %q", got)
+	}
+	if !strings.Contains(got, "\n│\n◐  docs") {
+		t.Fatalf("timeline should put a branch spacer between steps, got %q", got)
+	}
+	if strings.Contains(got, "│  ◇") || strings.Contains(got, "│  ◐") {
+		t.Fatalf("timeline should not indent step markers under branch line: %q", got)
+	}
+}
+
+func TestTimelineKeepsMultilineDetailsOnBranch(t *testing.T) {
+	m := model{state: runstate.State{Steps: []runstate.Step{
+		{Name: "commit", Status: runstate.StatusCompleted, Detail: "subject\n1 file changed"},
+	}}}
+	got := stripANSI(m.timeline())
+	if !strings.Contains(got, "◇  commit     subject\n│  1 file changed\n│\n") {
+		t.Fatalf("timeline should keep multiline details connected to branch, got %q", got)
+	}
+}
+
+var ansiRE = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+func stripANSI(s string) string {
+	return ansiRE.ReplaceAllString(s, "")
+}

@@ -1,0 +1,12 @@
+# Build output
+/bin/
+/dist/
+*.test
+
+# OS and editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# Local nml state from self-testing
+.git/nml/
