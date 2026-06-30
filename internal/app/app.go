@@ -1,7 +1,6 @@
 package app
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -13,6 +12,9 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"golang.org/x/term"
 
 	"github.com/natelindev/no-mistakes-lite/internal/agent"
 	"github.com/natelindev/no-mistakes-lite/internal/config"
@@ -76,6 +78,8 @@ func (a App) Run(ctx context.Context, args []string) int {
 		return a.respond(ctx, args[1:])
 	case "tui":
 		return a.tui(ctx, args[1:])
+	case "hooks":
+		return a.hooks(ctx, args[1:])
 	case "help", "--help", "-h":
 		a.printHelp()
 		return ExitOK
@@ -87,17 +91,18 @@ func (a App) Run(ctx context.Context, args []string) int {
 
 func (a App) home(ctx context.Context) int {
 	cfg := config.Defaults()
+	toon.KV(a.Out, "bin", currentExecutableDisplay())
+	toon.KV(a.Out, "description", "Run local no-mistakes-style validation for the current git workspace")
 	state, err := gitx.Inspect(ctx, a.Cwd, cfg.Remote, cfg.MainBranch, false)
 	if err != nil {
 		toon.Error(a.Out, err.Error(), nil)
 		return ExitError
 	}
 	if state.Kind == gitx.KindNoRepo {
-		if a.Interactive {
-			fmt.Fprint(a.Out, tui.RenderHome(tui.HomeState{State: string(state.Kind), Reason: state.Reason, Configured: false, Noop: true}))
-		} else {
-			fmt.Fprintln(a.Out, "Nothing to do: current directory is not inside a git repository.")
-		}
+		toon.KV(a.Out, "status", "noop")
+		toon.KV(a.Out, "state", state.Kind)
+		toon.KV(a.Out, "reason", state.Reason)
+		toon.List(a.Out, "help", []string{"Run `nml doctor` to check local tools and configuration.", "Run `nml init --yes --agent <name>` to create config."})
 		return ExitOK
 	}
 	cfg, paths, err := config.Load(state.RepoRoot)
@@ -111,83 +116,32 @@ func (a App) home(ctx context.Context) int {
 		return ExitError
 	}
 	configured := config.Exists(paths.GlobalPath)
-	if !configured && a.Interactive {
-		fmt.Fprintln(a.Err, "First run detected. Starting setup wizard.")
-		return a.init(ctx, []string{})
-	}
-	if a.Interactive {
-		return a.homeInteractive(ctx, state, configured)
-	}
-	if printNoop(a.Out, state) {
-		return ExitOK
-	}
+	_, latest, hasResumable := latestResumableRun(state.RepoRoot)
 	toon.KV(a.Out, "repo", state.RepoRoot)
 	toon.KV(a.Out, "branch", state.Branch)
 	toon.KV(a.Out, "state", state.Kind)
+	toon.KV(a.Out, "status", homeStatus(state))
 	toon.KV(a.Out, "reason", state.Reason)
-	help := []string{"Run `nml run --message \"<commit message>\"` to prepare validation.", "Run `nml resume` to continue a failed or interrupted run.", "Run `nml doctor` to check tools and configuration."}
-	if !configured {
-		help = append([]string{"Run `nml init --yes` or interactive `nml init` to create config."}, help...)
+	toon.KV(a.Out, "configured", configured)
+	if hasResumable {
+		toon.Table(a.Out, "resumable_runs", []string{"id", "status", "branch"}, []toon.Row{{latest.ID, displayRunStatus(latest), latest.ReviewBranch}})
+	}
+	changedFilesTruncated := false
+	if len(state.ChangedFiles) > 0 {
+		files := state.ChangedFiles
+		if len(files) > 20 {
+			files = files[:20]
+			changedFilesTruncated = true
+		}
+		toon.List(a.Out, "changed_files", files)
+		toon.KV(a.Out, "changed_files_count", len(state.ChangedFiles))
+	}
+	help := homeHelp(state, configured, hasResumable)
+	if changedFilesTruncated {
+		help = append(help, "Run `git status --short` to see all changed files.")
 	}
 	toon.List(a.Out, "help", help)
 	return ExitOK
-}
-
-func (a App) homeInteractive(ctx context.Context, state gitx.State, configured bool) int {
-	home := tui.HomeState{
-		Repo:       state.RepoRoot,
-		Branch:     state.Branch,
-		State:      string(state.Kind),
-		Reason:     state.Reason,
-		Configured: configured,
-		Noop:       isNoopState(state),
-	}
-	_, _, hasResumable := latestResumableRun(state.RepoRoot)
-	actions := homeActionOptions(state, configured, hasResumable)
-	if len(actions) == 0 || (isNoopState(state) && !hasResumable) {
-		fmt.Fprint(a.Out, tui.RenderHome(home))
-		return ExitOK
-	}
-	action, cancelled, err := tui.SelectHomeAction(ctx, a.In, a.Out, home, actions)
-	if err != nil {
-		toon.Error(a.Out, err.Error(), nil)
-		return ExitError
-	}
-	if cancelled || action == "exit" || action == "" {
-		return ExitOK
-	}
-	switch action {
-	case "run":
-		return a.run(ctx, nil)
-	case "init":
-		return a.init(ctx, nil)
-	case "doctor":
-		return a.doctor(ctx, nil)
-	case "resume":
-		return a.resume(ctx, nil)
-	default:
-		return ExitOK
-	}
-}
-
-func homeActionOptions(state gitx.State, configured bool, hasResumable bool) []tui.HomeAction {
-	var actions []tui.HomeAction
-	if hasResumable {
-		actions = append(actions, tui.HomeAction{ID: "resume", Label: "Resume latest run", Description: "continue failed or interrupted pipeline"})
-	}
-	if !configured {
-		actions = append(actions, tui.HomeAction{ID: "init", Label: "Set up nml", Description: "configure agent, repo, and validation commands"})
-	}
-	switch state.Kind {
-	case gitx.KindDirty:
-		actions = append(actions, tui.HomeAction{ID: "run", Label: "Validate dirty worktree", Description: "enter commit message and start pipeline"})
-	case gitx.KindFeatureDelta, gitx.KindMainAhead:
-		actions = append(actions, tui.HomeAction{ID: "run", Label: "Validate branch changes", Description: "start isolated pipeline"})
-	case gitx.KindNeedsRemoteBase:
-		actions = append(actions, tui.HomeAction{ID: "doctor", Label: "Run doctor", Description: "inspect remote and config state"})
-	}
-	actions = append(actions, tui.HomeAction{ID: "exit", Label: "Exit", Description: "leave without changing anything"})
-	return actions
 }
 
 type runOptions struct {
@@ -255,7 +209,7 @@ func (a App) run(ctx context.Context, args []string) int {
 		return ExitError
 	}
 	if first.Kind == gitx.KindNoRepo {
-		fmt.Fprintln(a.Out, "Nothing to do: current directory is not inside a git repository.")
+		printNoop(a.Out, first)
 		return ExitOK
 	}
 	cfg, _, err = config.Load(first.RepoRoot)
@@ -303,13 +257,6 @@ func (a App) run(ctx context.Context, args []string) int {
 	message := strings.TrimSpace(opts.Message)
 	if state.Kind == gitx.KindDirty {
 		diffStat, _ := client.WorktreeDiff(ctx)
-		if message == "" && a.Interactive && !opts.Yes && !opts.MessageFromAgent {
-			var cancelled bool
-			message, cancelled = a.promptWizard(ctx, "Commit message", "")
-			if cancelled {
-				return a.runCancelled()
-			}
-		}
 		startProgress()
 		generatedMessage, generatedIntent, generatedSource := a.generateCommitMessageAndIntent(ctx, cfg, state.RepoRoot, message, diffStat, "")
 		if message == "" {
@@ -337,7 +284,8 @@ func (a App) run(ctx context.Context, args []string) int {
 			return ExitError
 		}
 		if empty {
-			fmt.Fprintln(a.Out, "Nothing to do: selected paths have no staged changes.")
+			toon.KV(a.Out, "status", "noop")
+			toon.KV(a.Out, "reason", "selected paths have no staged changes")
 			return ExitOK
 		}
 		a.progress("committing dirty worktree")
@@ -396,11 +344,7 @@ func (a App) run(ctx context.Context, args []string) int {
 		return ExitError
 	}
 	if reviewOutcome.AwaitingUser {
-		if a.Interactive {
-			fmt.Fprint(a.Out, tui.RenderReviewGate(run.ID, path, run.WorktreePath, reviewOutcome.Findings))
-		} else {
-			printReviewGate(a.Out, run, path, reviewOutcome.Findings)
-		}
+		printReviewGate(a.Out, run, path, reviewOutcome.Findings)
 		return ExitOK
 	}
 	if err := a.runValidationCommands(ctx, cfg, opts, &run); err != nil {
@@ -426,11 +370,7 @@ func (a App) run(ctx context.Context, args []string) int {
 		toon.Error(a.Out, err.Error(), nil)
 		return ExitError
 	}
-	if a.Interactive {
-		fmt.Fprint(a.Out, tui.RenderRunResult(run, path))
-	} else {
-		printRunPrepared(a.Out, run, path)
-	}
+	printRunPrepared(a.Out, run, path)
 	return ExitOK
 }
 
@@ -1802,11 +1742,12 @@ func saveRun(ctx context.Context, client gitx.Client, state runstate.State) (str
 }
 
 func (a App) init(ctx context.Context, args []string) int {
-	var yes, skipSplash bool
+	var yes, skipSplash, interactiveSetup bool
 	var agentName, mainBranch, remote, testCmd, lintCmd, mergeMethod string
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.BoolVar(&yes, "yes", false, "accept detected defaults")
+	fs.BoolVar(&interactiveSetup, "interactive", false, "use interactive setup prompts")
 	fs.BoolVar(&skipSplash, "skip-splash", false, "skip splash banner")
 	fs.StringVar(&agentName, "agent", "", "agent name: pi, opencode, codex, or claude")
 	fs.StringVar(&mainBranch, "main", "", "main branch")
@@ -1822,11 +1763,15 @@ func (a App) init(ctx context.Context, args []string) int {
 		toon.Error(a.Out, err.Error(), []string{"Run `nml init --help` for usage."})
 		return ExitUsage
 	}
-	if !yes && !a.Interactive {
-		toon.Error(a.Out, "init needs a terminal unless --yes is passed", []string{"Run `nml init --yes --agent <name>` from a non-interactive shell."})
+	if !yes && !interactiveSetup {
+		toon.Error(a.Out, "init requires --yes or --interactive", []string{"Run `nml init --yes --agent <name>` for agent-safe setup.", "Run `nml init --interactive` for the guided setup wizard."})
 		return ExitUsage
 	}
-	if !skipSplash {
+	if interactiveSetup && !a.Interactive {
+		toon.Error(a.Out, "--interactive requires a terminal", []string{"Run `nml init --yes --agent <name>` from a non-interactive shell."})
+		return ExitUsage
+	}
+	if interactiveSetup && !skipSplash {
 		printSplash(a.Err)
 	}
 	if ctx.Err() != nil {
@@ -1851,7 +1796,7 @@ func (a App) init(ctx context.Context, args []string) int {
 		if len(foundAgents) == 1 || yes {
 			picked := agent.PickDefault(foundAgents)
 			agentName = picked.Name
-		} else if len(foundAgents) > 1 {
+		} else if interactiveSetup && len(foundAgents) > 1 {
 			picked, cancelled := a.chooseAgent(ctx, foundAgents)
 			if cancelled {
 				return a.setupCancelled()
@@ -1877,7 +1822,7 @@ func (a App) init(ctx context.Context, args []string) int {
 		_, detectedLint := detectCommands(rootOrCwd(root, a.Cwd))
 		lintCmd = detectedLint
 	}
-	if !yes && a.Interactive {
+	if interactiveSetup {
 		var cancelled bool
 		cfg.MainBranch, cancelled = a.promptWizard(ctx, "Main branch", cfg.MainBranch)
 		if cancelled {
@@ -2006,11 +1951,11 @@ func (a App) doctor(ctx context.Context, args []string) int {
 }
 
 func (a App) config(ctx context.Context, args []string) int {
-	format := "yaml"
+	format := "toon"
 	setTestCommand := ""
 	fs := flag.NewFlagSet("config", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	fs.StringVar(&format, "format", "yaml", "output format: yaml or toon")
+	fs.StringVar(&format, "format", "toon", "output format: toon or yaml")
 	fs.StringVar(&setTestCommand, "set-test-command", "", "save a per-repo test command")
 	if hasHelp(args) {
 		printConfigHelp(a.Out)
@@ -2075,10 +2020,12 @@ func (a App) config(ctx context.Context, args []string) int {
 func (a App) status(ctx context.Context, args []string) int {
 	format := "toon"
 	runRef := ""
+	full := false
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.StringVar(&format, "format", "toon", "output format: toon")
 	fs.StringVar(&runRef, "run", "", "run id or path")
+	fs.BoolVar(&full, "full", false, "show full long fields")
 	if hasHelp(args) {
 		printStatusHelp(a.Out)
 		return ExitOK
@@ -2095,7 +2042,7 @@ func (a App) status(ctx context.Context, args []string) int {
 	if code != ExitOK {
 		return code
 	}
-	printRunStatus(a.Out, state, path)
+	printRunStatus(a.Out, state, path, full)
 	return ExitOK
 }
 
@@ -2127,13 +2074,76 @@ func (a App) tui(ctx context.Context, args []string) int {
 	return ExitOK
 }
 
+func (a App) hooks(ctx context.Context, args []string) int {
+	if len(args) == 0 || hasHelp(args) {
+		printHooksHelp(a.Out)
+		return ExitOK
+	}
+	if args[0] != "install" {
+		toon.Error(a.Out, "unknown hooks command: "+args[0], []string{"Run `nml hooks install --apps claude,codex,opencode` to install session integrations."})
+		return ExitUsage
+	}
+	appsValue := "claude,codex,opencode"
+	scope := "user"
+	fs := flag.NewFlagSet("hooks install", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fs.StringVar(&appsValue, "apps", appsValue, "comma-separated apps: claude,codex,opencode")
+	fs.StringVar(&scope, "scope", scope, "install scope: user or project")
+	if err := fs.Parse(args[1:]); err != nil {
+		toon.Error(a.Out, err.Error(), []string{"Run `nml hooks install --help` for usage."})
+		return ExitUsage
+	}
+	if fs.NArg() > 0 {
+		toon.Error(a.Out, "hooks install does not accept positional arguments", []string{"Run `nml hooks install --apps claude,codex,opencode`."})
+		return ExitUsage
+	}
+	if scope != "user" && scope != "project" {
+		toon.Error(a.Out, "invalid --scope: "+scope, []string{"Use `--scope user` or `--scope project`."})
+		return ExitUsage
+	}
+	apps, err := parseHookApps(appsValue)
+	if err != nil {
+		toon.Error(a.Out, err.Error(), []string{"Use one or more of: claude, codex, opencode."})
+		return ExitUsage
+	}
+	repoRoot := ""
+	if scope == "project" {
+		st, err := gitx.Inspect(ctx, a.Cwd, "origin", "main", false)
+		if err != nil {
+			toon.Error(a.Out, err.Error(), nil)
+			return ExitError
+		}
+		if st.Kind == gitx.KindNoRepo {
+			toon.Error(a.Out, "project-scoped hooks require a git repository", []string{"cd into a repository, then run `nml hooks install --scope project`."})
+			return ExitUsage
+		}
+		repoRoot = st.RepoRoot
+	}
+	command := hookExecutableCommand()
+	rows := make([]toon.Row, 0, len(apps)+1)
+	for _, appName := range apps {
+		path, status, err := installHookIntegration(appName, scope, repoRoot, command)
+		if err != nil {
+			toon.Error(a.Out, err.Error(), []string{"Fix the integration file and rerun `nml hooks install`."})
+			return ExitError
+		}
+		rows = append(rows, toon.Row{appName, status, shortPath(path)})
+	}
+	toon.KV(a.Out, "command", command)
+	toon.Table(a.Out, "integrations", []string{"app", "status", "path"}, rows)
+	toon.List(a.Out, "help", []string{"Run `nml` to preview the context injected at session start.", "Restart the target agent so it reloads hooks or plugins."})
+	return ExitOK
+}
+
 func (a App) findings(ctx context.Context, args []string) int {
 	format := "toon"
 	runRef := ""
+	full := false
 	fs := flag.NewFlagSet("findings", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.StringVar(&format, "format", "toon", "output format: toon")
 	fs.StringVar(&runRef, "run", "", "run id or path")
+	fs.BoolVar(&full, "full", false, "show full finding descriptions")
 	if hasHelp(args) {
 		printFindingsHelp(a.Out)
 		return ExitOK
@@ -2151,6 +2161,7 @@ func (a App) findings(ctx context.Context, args []string) int {
 		return code
 	}
 	var rows []toon.Row
+	truncated := false
 	for _, step := range state.Steps {
 		if step.Name != "review" {
 			continue
@@ -2161,15 +2172,21 @@ func (a App) findings(ctx context.Context, args []string) int {
 				if finding.Line > 0 {
 					line = fmt.Sprint(finding.Line)
 				}
-				rows = append(rows, toon.Row{finding.ID, string(finding.Severity), finding.File, line, finding.Description})
+				description, wasTruncated := previewText(finding.Description, full, detailPreviewLimit)
+				truncated = truncated || wasTruncated
+				rows = append(rows, toon.Row{finding.ID, string(finding.Severity), finding.File, line, description})
 			}
 		}
 	}
 	if len(rows) == 0 {
-		fmt.Fprintln(a.Out, "findings: 0 review findings found for this run")
+		toon.KV(a.Out, "findings", "0 review findings found for this run")
 		return ExitOK
 	}
+	toon.KV(a.Out, "count", fmt.Sprintf("%d total", len(rows)))
 	toon.Table(a.Out, "findings", []string{"id", "severity", "file", "line", "description"}, rows)
+	if truncated {
+		toon.List(a.Out, "help", []string{"Run `nml findings --run " + state.ID + " --full` to see complete descriptions."})
+	}
 	return ExitOK
 }
 
@@ -2235,13 +2252,14 @@ func (a App) runs(ctx context.Context, args []string) int {
 		return ExitError
 	}
 	if len(entries) == 0 {
-		fmt.Fprintln(a.Out, "runs: 0 saved runs found")
+		toon.KV(a.Out, "runs", "0 saved runs found")
 		return ExitOK
 	}
 	rows := make([]toon.Row, 0, len(entries))
 	for _, entry := range entries {
 		rows = append(rows, toon.Row{entry.RunID, entry.Status, shortPath(entry.RepoRoot), entry.ReviewBranch, entry.PRURL, entry.UpdatedAt.Format(time.RFC3339)})
 	}
+	toon.KV(a.Out, "count", fmt.Sprintf("%d total", len(entries)))
 	toon.Table(a.Out, "runs", []string{"id", "status", "repo", "branch", "pr", "updated"}, rows)
 	toon.List(a.Out, "help", []string{"Run `nml resume --run <id>` to continue a resumable run.", "Run `nml status --run <id>` to inspect a run."})
 	return ExitOK
@@ -2254,16 +2272,12 @@ type cfgLoadOptions struct {
 
 func (a App) continueRun(ctx context.Context, options cfgLoadOptions, state runstate.State) int {
 	if !session.Resumable(state) {
-		printRunStatus(a.Out, state, options.StatePath)
+		printRunStatus(a.Out, state, options.StatePath, false)
 		toon.List(a.Out, "help", []string{"Run is already completed.", "Run `nml run` to start a new validation run when the repository has new changes."})
 		return ExitOK
 	}
 	if reviewStatus := stepStatus(state, "review"); reviewStatus == runstate.StatusAwaitingUser {
-		if a.Interactive {
-			fmt.Fprint(a.Out, tui.RenderReviewGate(state.ID, options.StatePath, state.WorktreePath, latestReviewFindings(state)))
-		} else {
-			printReviewGate(a.Out, state, options.StatePath, latestReviewFindings(state))
-		}
+		printReviewGate(a.Out, state, options.StatePath, latestReviewFindings(state))
 		return ExitOK
 	}
 	if strings.TrimSpace(state.RepoRoot) == "" || strings.TrimSpace(state.WorktreePath) == "" {
@@ -2294,11 +2308,7 @@ func (a App) continueRun(ctx context.Context, options cfgLoadOptions, state runs
 			return ExitError
 		}
 		if outcome.AwaitingUser {
-			if a.Interactive {
-				fmt.Fprint(a.Out, tui.RenderReviewGate(state.ID, options.StatePath, state.WorktreePath, outcome.Findings))
-			} else {
-				printReviewGate(a.Out, state, options.StatePath, outcome.Findings)
-			}
+			printReviewGate(a.Out, state, options.StatePath, outcome.Findings)
 			return ExitOK
 		}
 	}
@@ -2328,11 +2338,7 @@ func (a App) continueRun(ctx context.Context, options cfgLoadOptions, state runs
 		toon.Error(a.Out, err.Error(), nil)
 		return ExitError
 	}
-	if a.Interactive {
-		fmt.Fprint(a.Out, tui.RenderRunResult(state, path))
-	} else {
-		printRunPrepared(a.Out, state, path)
-	}
+	printRunPrepared(a.Out, state, path)
 	return ExitOK
 }
 
@@ -2413,11 +2419,7 @@ func (a App) respond(ctx context.Context, args []string) int {
 		}
 		path, _ = saveRun(ctx, client, state)
 		if outcome.AwaitingUser {
-			if a.Interactive {
-				fmt.Fprint(a.Out, tui.RenderReviewGate(state.ID, path, state.WorktreePath, outcome.Findings))
-			} else {
-				printReviewGate(a.Out, state, path, outcome.Findings)
-			}
+			printReviewGate(a.Out, state, path, outcome.Findings)
 			return ExitOK
 		}
 	}
@@ -2439,12 +2441,7 @@ func (a App) respond(ctx context.Context, args []string) int {
 		toon.Error(a.Out, err.Error(), nil)
 		return ExitError
 	}
-	_ = path
-	if a.Interactive {
-		fmt.Fprint(a.Out, tui.RenderRunResult(state, path))
-	} else {
-		printRunPrepared(a.Out, state, path)
-	}
+	printRunPrepared(a.Out, state, path)
 	return ExitOK
 }
 
@@ -2522,6 +2519,51 @@ func latestResumableRun(repoRoot string) (string, runstate.State, bool) {
 	return path, state, true
 }
 
+func currentExecutableDisplay() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "nml"
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(exe); resolveErr == nil {
+		exe = resolved
+	}
+	if abs, absErr := filepath.Abs(exe); absErr == nil {
+		exe = abs
+	}
+	return shortPath(exe)
+}
+
+func hookExecutableCommand() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "nml"
+	}
+	if abs, absErr := filepath.Abs(exe); absErr == nil {
+		exe = abs
+	}
+	if path, lookErr := exec.LookPath("nml"); lookErr == nil && sameExecutable(path, exe) {
+		return "nml"
+	}
+	return exe
+}
+
+func sameExecutable(a, b string) bool {
+	if ar, err := filepath.EvalSymlinks(a); err == nil {
+		a = ar
+	}
+	if br, err := filepath.EvalSymlinks(b); err == nil {
+		b = br
+	}
+	ainfo, aerr := os.Stat(a)
+	binfo, berr := os.Stat(b)
+	if aerr == nil && berr == nil {
+		return os.SameFile(ainfo, binfo)
+	}
+	aa, _ := filepath.Abs(a)
+	bb, _ := filepath.Abs(b)
+	return filepath.Clean(aa) == filepath.Clean(bb)
+}
+
 func shortPath(path string) string {
 	home, err := os.UserHomeDir()
 	if err == nil {
@@ -2530,6 +2572,311 @@ func shortPath(path string) string {
 		}
 	}
 	return path
+}
+
+func parseHookApps(value string) ([]string, error) {
+	seen := map[string]bool{}
+	var apps []string
+	for _, part := range strings.Split(value, ",") {
+		appName := strings.ToLower(strings.TrimSpace(part))
+		if appName == "" || seen[appName] {
+			continue
+		}
+		switch appName {
+		case "claude", "codex", "opencode":
+			seen[appName] = true
+			apps = append(apps, appName)
+		default:
+			return nil, fmt.Errorf("unsupported app: %s", appName)
+		}
+	}
+	if len(apps) == 0 {
+		return nil, fmt.Errorf("--apps must include at least one app")
+	}
+	return apps, nil
+}
+
+func installHookIntegration(appName, scope, repoRoot, command string) (string, string, error) {
+	switch appName {
+	case "claude":
+		return installClaudeHook(scope, repoRoot, command)
+	case "codex":
+		return installCodexHook(scope, repoRoot, command)
+	case "opencode":
+		return installOpenCodePlugin(scope, repoRoot, command)
+	default:
+		return "", "", fmt.Errorf("unsupported app: %s", appName)
+	}
+}
+
+func installClaudeHook(scope, repoRoot, command string) (string, string, error) {
+	path, err := scopedPath(scope, repoRoot, filepath.Join(".claude", "settings.json"), filepath.Join(".claude", "settings.json"))
+	if err != nil {
+		return "", "", err
+	}
+	data, err := loadJSONMap(path)
+	if err != nil {
+		return "", "", err
+	}
+	upsertSessionStartHook(data, command, "startup|resume|clear")
+	status, err := writeJSONMapIfChanged(path, data)
+	return path, status, err
+}
+
+func installCodexHook(scope, repoRoot, command string) (string, string, error) {
+	hooksPath, err := scopedPath(scope, repoRoot, filepath.Join(".codex", "hooks.json"), filepath.Join(".codex", "hooks.json"))
+	if err != nil {
+		return "", "", err
+	}
+	data, err := loadJSONMap(hooksPath)
+	if err != nil {
+		return "", "", err
+	}
+	upsertSessionStartHook(data, command, "startup|resume|clear")
+	status, err := writeJSONMapIfChanged(hooksPath, data)
+	if err != nil {
+		return "", "", err
+	}
+	configPath, err := scopedPath(scope, repoRoot, filepath.Join(".codex", "config.toml"), filepath.Join(".codex", "config.toml"))
+	if err != nil {
+		return "", "", err
+	}
+	configStatus, err := ensureCodexHooksFeature(configPath)
+	if err != nil {
+		return "", "", err
+	}
+	if status == "unchanged" && configStatus != "unchanged" {
+		status = configStatus
+	}
+	return hooksPath, status, nil
+}
+
+func installOpenCodePlugin(scope, repoRoot, command string) (string, string, error) {
+	path, err := scopedPath(scope, repoRoot, filepath.Join(".config", "opencode", "plugins", "nml-context.js"), filepath.Join(".opencode", "plugins", "nml-context.js"))
+	if err != nil {
+		return "", "", err
+	}
+	content := openCodePluginContent(command)
+	status, err := writeTextIfChanged(path, content, 0o644)
+	return path, status, err
+}
+
+func scopedPath(scope, repoRoot, userRel, projectRel string) (string, error) {
+	if scope == "project" {
+		if strings.TrimSpace(repoRoot) == "" {
+			return "", fmt.Errorf("project scope requires a repository")
+		}
+		return filepath.Join(repoRoot, projectRel), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, userRel), nil
+}
+
+func loadJSONMap(path string) (map[string]any, error) {
+	data := map[string]any{}
+	raw, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return data, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return data, nil
+	}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return data, nil
+}
+
+func writeJSONMapIfChanged(path string, data map[string]any) (string, error) {
+	raw, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	raw = append(raw, '\n')
+	return writeBytesIfChanged(path, raw, 0o600)
+}
+
+func writeTextIfChanged(path, text string, mode os.FileMode) (string, error) {
+	return writeBytesIfChanged(path, []byte(text), mode)
+}
+
+func writeBytesIfChanged(path string, data []byte, mode os.FileMode) (string, error) {
+	old, err := os.ReadFile(path)
+	if err == nil && string(old) == string(data) {
+		return "unchanged", nil
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, data, mode); err != nil {
+		return "", err
+	}
+	if os.IsNotExist(err) {
+		return "installed", nil
+	}
+	return "updated", nil
+}
+
+func upsertSessionStartHook(data map[string]any, command, matcher string) {
+	hooksObj, _ := data["hooks"].(map[string]any)
+	if hooksObj == nil {
+		hooksObj = map[string]any{}
+		data["hooks"] = hooksObj
+	}
+	existing, _ := hooksObj["SessionStart"].([]any)
+	filtered := make([]any, 0, len(existing)+1)
+	for _, group := range existing {
+		cleaned, keep := removeNMLHooksFromGroup(group, command)
+		if keep {
+			filtered = append(filtered, cleaned)
+		}
+	}
+	filtered = append(filtered, map[string]any{
+		"matcher": matcher,
+		"hooks": []any{map[string]any{
+			"type":          "command",
+			"command":       command,
+			"args":          []any{},
+			"timeout":       5,
+			"statusMessage": "Loading nml workspace status",
+		}},
+	})
+	hooksObj["SessionStart"] = filtered
+}
+
+func removeNMLHooksFromGroup(group any, currentCommand string) (any, bool) {
+	obj, ok := group.(map[string]any)
+	if !ok {
+		return group, true
+	}
+	hooks, _ := obj["hooks"].([]any)
+	if len(hooks) == 0 {
+		return group, true
+	}
+	cleaned := make([]any, 0, len(hooks))
+	removed := false
+	for _, hook := range hooks {
+		hookObj, ok := hook.(map[string]any)
+		if ok && isNMLCommand(fmt.Sprint(hookObj["command"]), currentCommand) {
+			removed = true
+			continue
+		}
+		cleaned = append(cleaned, hook)
+	}
+	if !removed {
+		return group, true
+	}
+	if len(cleaned) == 0 {
+		return nil, false
+	}
+	obj["hooks"] = cleaned
+	return obj, true
+}
+
+func isNMLCommand(command, currentCommand string) bool {
+	command = strings.TrimSpace(command)
+	currentCommand = strings.TrimSpace(currentCommand)
+	if command == "nml" || command == currentCommand {
+		return true
+	}
+	if command != "" && currentCommand != "" && sameExecutable(command, currentCommand) {
+		return true
+	}
+	base := filepath.Base(command)
+	return base == "nml"
+}
+
+func ensureCodexHooksFeature(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+	updated := ensureTOMLFeatureHooks(string(raw))
+	return writeTextIfChanged(path, updated, 0o600)
+}
+
+func ensureTOMLFeatureHooks(input string) string {
+	lines := strings.Split(input, "\n")
+	featuresIndex := -1
+	for i, line := range lines {
+		if strings.TrimSpace(line) == "[features]" {
+			featuresIndex = i
+			break
+		}
+	}
+	if featuresIndex == -1 {
+		trimmed := strings.TrimRight(input, "\n")
+		if trimmed != "" {
+			trimmed += "\n\n"
+		}
+		return trimmed + "[features]\nhooks = true\n"
+	}
+	end := len(lines)
+	for i := featuresIndex + 1; i < len(lines); i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			end = i
+			break
+		}
+	}
+	for i := featuresIndex + 1; i < end; i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(trimmed, "hooks") && strings.Contains(trimmed, "=") {
+			lines[i] = "hooks = true"
+			return strings.TrimRight(strings.Join(lines, "\n"), "\n") + "\n"
+		}
+	}
+	out := append([]string{}, lines[:featuresIndex+1]...)
+	out = append(out, "hooks = true")
+	out = append(out, lines[featuresIndex+1:]...)
+	return strings.TrimRight(strings.Join(out, "\n"), "\n") + "\n"
+}
+
+func openCodePluginContent(command string) string {
+	encoded, _ := json.Marshal(command)
+	return fmt.Sprintf(`import { spawnSync } from "node:child_process";
+
+const command = %s;
+
+function appendSystem(output, context) {
+  if (!output) {
+    return { system: context };
+  }
+  if (Array.isArray(output.system)) {
+    output.system.push(context);
+  } else {
+    output.system = output.system ? output.system + "\n\n" + context : context;
+  }
+  return output;
+}
+
+export const NMLContextPlugin = async ({ directory }) => {
+  return {
+    "experimental.chat.system.transform": async (_input, output) => {
+      const result = spawnSync(command, [], {
+        cwd: directory,
+        encoding: "utf8",
+        timeout: 5000,
+        maxBuffer: 64 * 1024,
+      });
+      const stdout = result.stdout ? result.stdout.trim() : "";
+      if (result.status !== 0 || stdout.length === 0) {
+        return output ?? {};
+      }
+      return appendSystem(output, "nml workspace status:\n" + stdout);
+    },
+  };
+};
+`, string(encoded))
 }
 
 func (a App) loadRunForResume(ctx context.Context, runRef string) (string, runstate.State, int) {
@@ -2622,23 +2969,64 @@ func isNoopState(state gitx.State) bool {
 	}
 }
 
+func homeStatus(state gitx.State) string {
+	if isNoopState(state) {
+		return "noop"
+	}
+	return "actionable"
+}
+
+func homeHelp(state gitx.State, configured, hasResumable bool) []string {
+	var help []string
+	if !configured {
+		help = append(help, "Run `nml init --yes --agent <name>` to create config.")
+	}
+	if hasResumable {
+		help = append(help, "Run `nml resume` to continue a failed or interrupted run.")
+	}
+	switch state.Kind {
+	case gitx.KindDirty:
+		help = append(help, "Run `nml run --message \"<commit message>\"` to validate dirty work.")
+	case gitx.KindFeatureDelta, gitx.KindMainAhead:
+		help = append(help, "Run `nml run` to validate branch changes.")
+	case gitx.KindNeedsRemoteBase:
+		help = append(help, fmt.Sprintf("Run `git fetch %s %s` so nml can compare against the remote base.", state.Remote, state.MainBranch))
+	case gitx.KindCleanMainNoop, gitx.KindFeatureNoDeltaNoop:
+		help = append(help, "Run `nml run --message \"<commit message>\"` after making changes.")
+	}
+	help = append(help, "Run `nml doctor` to check tools and configuration.")
+	return help
+}
+
 func printNoop(w io.Writer, state gitx.State) bool {
 	switch state.Kind {
-	case gitx.KindNoRepo:
-		fmt.Fprintln(w, "Nothing to do: current directory is not inside a git repository.")
-		return true
-	case gitx.KindCleanMainNoop:
-		fmt.Fprintf(w, "Nothing to do: %s is clean and not ahead of %s/%s.\n", state.MainBranch, state.Remote, state.MainBranch)
-		return true
-	case gitx.KindFeatureNoDeltaNoop:
-		if state.PatchOnly {
-			fmt.Fprintln(w, "Nothing to do: changes are already on main.")
-		} else {
-			fmt.Fprintf(w, "Nothing to do: this branch has no changes relative to %s/%s.\n", state.Remote, state.MainBranch)
-		}
+	case gitx.KindNoRepo, gitx.KindCleanMainNoop, gitx.KindFeatureNoDeltaNoop:
+		toon.KV(w, "status", "noop")
+		toon.KV(w, "state", state.Kind)
+		toon.KV(w, "reason", state.Reason)
 		return true
 	}
 	return false
+}
+
+const detailPreviewLimit = 1200
+
+func previewText(s string, full bool, limit int) (string, bool) {
+	if full || limit <= 0 || len(s) <= limit {
+		return s, false
+	}
+	prefix := safeBytePrefix(s, limit)
+	return prefix + fmt.Sprintf("\n... (truncated, %d bytes total)", len(s)), true
+}
+
+func safeBytePrefix(s string, limit int) string {
+	if limit >= len(s) {
+		return s
+	}
+	for limit > 0 && !utf8.ValidString(s[:limit]) {
+		limit--
+	}
+	return s[:limit]
 }
 
 func printReviewGate(w io.Writer, state runstate.State, path string, findings []review.Finding) {
@@ -2647,15 +3035,22 @@ func printReviewGate(w io.Writer, state runstate.State, path string, findings []
 	toon.KV(w, "state_path", path)
 	toon.KV(w, "worktree_path", state.WorktreePath)
 	rows := make([]toon.Row, 0, len(findings))
+	truncated := false
 	for _, finding := range findings {
 		line := ""
 		if finding.Line > 0 {
 			line = fmt.Sprint(finding.Line)
 		}
-		rows = append(rows, toon.Row{finding.ID, string(finding.Severity), finding.File, line, finding.Description})
+		description, wasTruncated := previewText(finding.Description, false, detailPreviewLimit)
+		truncated = truncated || wasTruncated
+		rows = append(rows, toon.Row{finding.ID, string(finding.Severity), finding.File, line, description})
 	}
 	toon.Table(w, "findings", []string{"id", "severity", "file", "line", "description"}, rows)
-	toon.List(w, "help", []string{"Run `nml respond --action fix --findings <ids> --run " + state.ID + "` to fix selected findings.", "Run `nml respond --action approve --run " + state.ID + "` to accept and continue.", "Run `nml respond --action skip --run " + state.ID + "` to skip review."})
+	help := []string{"Run `nml respond --action fix --findings <ids> --run " + state.ID + "` to fix selected findings.", "Run `nml respond --action approve --run " + state.ID + "` to accept and continue.", "Run `nml respond --action skip --run " + state.ID + "` to skip review."}
+	if truncated {
+		help = append(help, "Run `nml findings --run "+state.ID+" --full` to see complete descriptions.")
+	}
+	toon.List(w, "help", help)
 }
 
 func printRunPrepared(w io.Writer, state runstate.State, path string) {
@@ -2666,16 +3061,23 @@ func printRunPrepared(w io.Writer, state runstate.State, path string) {
 	toon.KV(w, "review_branch", state.ReviewBranch)
 	toon.KV(w, "worktree_path", state.WorktreePath)
 	toon.KV(w, "base", state.BaseRef)
-	toon.KV(w, "intent", state.Intent)
-	toon.Table(w, "steps", []string{"name", "status", "detail"}, stepRows(state))
-	toon.List(w, "help", []string{"Inspect this run with `nml status --run " + state.ID + "`.", "Return the lease manually with `treehouse return " + state.WorktreePath + " --force` if you want to clean up before CI and deploy stages exist."})
+	intent, truncated := previewText(state.Intent, false, detailPreviewLimit)
+	toon.KV(w, "intent", intent)
+	rows, stepTruncated := stepRows(state, false)
+	truncated = truncated || stepTruncated
+	toon.Table(w, "steps", []string{"name", "status", "detail"}, rows)
+	help := []string{"Inspect this run with `nml status --run " + state.ID + "`.", "Return the lease manually with `treehouse return " + state.WorktreePath + " --force` if you want to clean up."}
+	if truncated {
+		help = append(help, "Run `nml status --run "+state.ID+" --full` to see complete long fields.")
+	}
+	toon.List(w, "help", help)
 }
 
 func displayRunStatus(state runstate.State) string {
 	return session.Status(state)
 }
 
-func printRunStatus(w io.Writer, state runstate.State, path string) {
+func printRunStatus(w io.Writer, state runstate.State, path string, full bool) {
 	toon.KV(w, "run", state.ID)
 	toon.KV(w, "path", path)
 	toon.KV(w, "repo", state.RepoRoot)
@@ -2684,15 +3086,25 @@ func printRunStatus(w io.Writer, state runstate.State, path string) {
 	toon.KV(w, "worktree_path", state.WorktreePath)
 	toon.KV(w, "base", state.BaseRef)
 	toon.KV(w, "pr_url", state.PRURL)
-	toon.Table(w, "steps", []string{"name", "status", "detail"}, stepRows(state))
+	intent, truncated := previewText(state.Intent, full, detailPreviewLimit)
+	toon.KV(w, "intent", intent)
+	rows, stepTruncated := stepRows(state, full)
+	truncated = truncated || stepTruncated
+	toon.Table(w, "steps", []string{"name", "status", "detail"}, rows)
+	if truncated {
+		toon.List(w, "help", []string{"Run `nml status --run " + state.ID + " --full` to see complete long fields."})
+	}
 }
 
-func stepRows(state runstate.State) []toon.Row {
+func stepRows(state runstate.State, full bool) ([]toon.Row, bool) {
 	rows := make([]toon.Row, 0, len(state.Steps))
+	truncated := false
 	for _, step := range state.Steps {
-		rows = append(rows, toon.Row{step.Name, string(step.Status), step.Detail})
+		detail, wasTruncated := previewText(step.Detail, full, detailPreviewLimit)
+		truncated = truncated || wasTruncated
+		rows = append(rows, toon.Row{step.Name, string(step.Status), detail})
 	}
-	return rows
+	return rows, truncated
 }
 
 func fallbackCommitMessage(files []string) string {
@@ -2850,24 +3262,6 @@ func (a App) chooseAgent(ctx context.Context, found []agent.Found) (string, bool
 	return found[idx].Name, false
 }
 
-func (a App) prompt(label, def string) string {
-	if !a.Interactive {
-		return def
-	}
-	if def == "" {
-		fmt.Fprintf(a.Err, "%s: ", label)
-	} else {
-		fmt.Fprintf(a.Err, "%s [%s]: ", label, def)
-	}
-	reader := bufio.NewReader(a.In)
-	text, _ := reader.ReadString('\n')
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return def
-	}
-	return text
-}
-
 func (a App) promptWizard(ctx context.Context, label, def string) (string, bool) {
 	if !a.Interactive {
 		return def, false
@@ -2914,11 +3308,6 @@ func (a App) promptChoice(ctx context.Context, label, def string, choices []stri
 
 func (a App) setupCancelled() int {
 	fmt.Fprintln(a.Err, "Setup cancelled.")
-	return ExitError
-}
-
-func (a App) runCancelled() int {
-	fmt.Fprintln(a.Err, "Run cancelled.")
 	return ExitError
 }
 
@@ -3026,11 +3415,7 @@ func isTerminal(r io.Reader) bool {
 	if !ok {
 		return false
 	}
-	info, err := file.Stat()
-	if err != nil {
-		return false
-	}
-	return info.Mode()&os.ModeCharDevice != 0
+	return term.IsTerminal(int(file.Fd()))
 }
 
 func hasHelp(args []string) bool {
@@ -3060,86 +3445,176 @@ func printSplash(w io.Writer) {
 func (a App) printHelp() {
 	fmt.Fprintln(a.Out, "nml - lightweight no-mistakes-style PR validation")
 	fmt.Fprintln(a.Out)
+	fmt.Fprintln(a.Out, "Usage: nml <command> [flags]")
+	fmt.Fprintln(a.Out)
 	fmt.Fprintln(a.Out, "Commands:")
-	fmt.Fprintln(a.Out, "  nml                  inspect repo and show next action")
-	fmt.Fprintln(a.Out, "  nml init             first-run setup wizard")
+	fmt.Fprintln(a.Out, "  nml                  print compact workspace status in TOON")
+	fmt.Fprintln(a.Out, "  nml init             create ~/.config/nml/config.yaml")
 	fmt.Fprintln(a.Out, "  nml doctor           check tools, auth, config, and repo state")
-	fmt.Fprintln(a.Out, "  nml run              prepare a validation run")
+	fmt.Fprintln(a.Out, "  nml run              prepare and validate a run")
 	fmt.Fprintln(a.Out, "  nml status           show latest run state")
 	fmt.Fprintln(a.Out, "  nml findings         show review findings for a run")
-	fmt.Fprintln(a.Out, "  nml config           print merged config")
+	fmt.Fprintln(a.Out, "  nml config           print or edit merged config")
 	fmt.Fprintln(a.Out, "  nml runs             list saved runs from ~/.nml")
 	fmt.Fprintln(a.Out, "  nml resume           continue latest resumable run")
 	fmt.Fprintln(a.Out, "  nml respond          answer a saved review gate")
+	fmt.Fprintln(a.Out, "  nml hooks install    install agent session integrations")
 	fmt.Fprintln(a.Out, "  nml tui              show latest run in an interactive TUI")
+	fmt.Fprintln(a.Out)
+	fmt.Fprintln(a.Out, "Examples:")
+	fmt.Fprintln(a.Out, "  nml")
+	fmt.Fprintln(a.Out, "  nml run --message \"fix: handle empty input\"")
+	fmt.Fprintln(a.Out, "  nml status --run <id> --full")
 }
 
 func printRunHelp(w io.Writer) {
 	fmt.Fprintln(w, "Usage: nml run [flags]")
+	fmt.Fprintln(w, "Prepares isolated validation for dirty work or branch changes.")
 	fmt.Fprintln(w, "Flags:")
-	fmt.Fprintln(w, "  --message <text>        commit message for dirty worktree")
-	fmt.Fprintln(w, "  --message-from-agent    request agent-generated commit message")
-	fmt.Fprintln(w, "  --paths <a,b>           stage selected paths instead of all")
-	fmt.Fprintln(w, "  --yes                   accept safe defaults without prompts")
-	fmt.Fprintln(w, "  --yolo                  auto-select all actionable findings")
-	fmt.Fprintln(w, "  --auto-merge            enable auto-merge for this run only")
-	fmt.Fprintln(w, "  --merge-method <m>      squash, merge, or rebase")
-	fmt.Fprintln(w, "  --skip-docs             skip docs for this run")
-	fmt.Fprintln(w, "  --skip-deploy           skip deploy for this run")
-	fmt.Fprintln(w, "  --ci-timeout <dur>      override CI timeout")
-	fmt.Fprintln(w, "  --test-command <cmd>    override test command for this run only")
+	fmt.Fprintln(w, "  --message <text>          commit message for dirty worktree (default: generated fallback)")
+	fmt.Fprintln(w, "  --message-from-agent      request agent-generated commit message (default: false)")
+	fmt.Fprintln(w, "  --paths <a,b>             stage selected paths instead of all changes (default: all)")
+	fmt.Fprintln(w, "  --yes                     accept safe defaults without prompts (default: false)")
+	fmt.Fprintln(w, "  --yolo                    auto-select all actionable findings (default: false)")
+	fmt.Fprintln(w, "  --auto-merge              enable auto-merge for this run only (default: false)")
+	fmt.Fprintln(w, "  --merge-method <method>   squash, merge, or rebase (default: config value)")
+	fmt.Fprintln(w, "  --skip-docs               skip docs for this run (default: false)")
+	fmt.Fprintln(w, "  --skip-deploy             skip deploy for this run (default: false)")
+	fmt.Fprintln(w, "  --ci-timeout <duration>   override CI timeout (default: config value)")
+	fmt.Fprintln(w, "  --test-command <cmd>      override test command for this run only (default: config value)")
+	fmt.Fprintln(w, "  --fetch <bool>            fetch remote main before classification (default: true)")
+	fmt.Fprintln(w, "Examples:")
+	fmt.Fprintln(w, "  nml run --message \"fix: handle empty input\"")
+	fmt.Fprintln(w, "  nml run --paths src/a.go,src/b.go --message \"fix: limit parser scope\"")
+	fmt.Fprintln(w, "  nml run --test-command \"go test ./...\" --skip-deploy")
 }
 
 func printInitHelp(w io.Writer) {
-	fmt.Fprintln(w, "Usage: nml init [--yes] [--agent <name>] [--main <branch>] [--remote <name>]")
-	fmt.Fprintln(w, "Creates ~/.config/nml/config.yaml after detecting git, treehouse, agents, gh, tests, and lint.")
+	fmt.Fprintln(w, "Usage: nml init [flags]")
+	fmt.Fprintln(w, "Creates ~/.config/nml/config.yaml after detecting local tools.")
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --yes                         accept detected defaults (default: false)")
+	fmt.Fprintln(w, "  --interactive                 use guided setup prompts (default: false)")
+	fmt.Fprintln(w, "  --skip-splash                 skip splash banner (default: false)")
+	fmt.Fprintln(w, "  --agent <name>                pi, opencode, codex, or claude (default: detected)")
+	fmt.Fprintln(w, "  --main <branch>               main branch (default: detected or main)")
+	fmt.Fprintln(w, "  --remote <name>               git remote (default: origin)")
+	fmt.Fprintln(w, "  --test <cmd>                  test command (default: none)")
+	fmt.Fprintln(w, "  --lint <cmd>                  lint command (default: detected)")
+	fmt.Fprintln(w, "  --auto-merge-method <method>  squash, merge, or rebase (default: squash)")
+	fmt.Fprintln(w, "Examples:")
+	fmt.Fprintln(w, "  nml init --yes --agent codex")
+	fmt.Fprintln(w, "  nml init --yes --agent pi --main main --remote origin")
+	fmt.Fprintln(w, "  nml init --yes --agent claude --test \"go test ./...\" --lint \"go vet ./...\"")
+	fmt.Fprintln(w, "  nml init --interactive")
 }
 
 func printDoctorHelp(w io.Writer) {
 	fmt.Fprintln(w, "Usage: nml doctor")
 	fmt.Fprintln(w, "Prints a compact TOON table of tool, auth, config, and repo checks.")
+	fmt.Fprintln(w, "Examples:")
+	fmt.Fprintln(w, "  nml doctor")
+	fmt.Fprintln(w, "  nml doctor | tee /tmp/nml-doctor.toon")
 }
 
 func printConfigHelp(w io.Writer) {
-	fmt.Fprintln(w, "Usage: nml config [--format yaml|toon]")
-	fmt.Fprintln(w, "       nml config --set-test-command \"<cmd>\"")
+	fmt.Fprintln(w, "Usage: nml config [flags]")
 	fmt.Fprintln(w, "Prints merged config or saves a per-repo test command.")
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --format <toon|yaml>       output format (default: toon)")
+	fmt.Fprintln(w, "  --set-test-command <cmd>   save a per-repo test command (default: none)")
+	fmt.Fprintln(w, "Examples:")
+	fmt.Fprintln(w, "  nml config --format toon")
+	fmt.Fprintln(w, "  nml config --set-test-command \"go test ./...\"")
+	fmt.Fprintln(w, "  nml config --format yaml")
 }
 
 func printStatusHelp(w io.Writer) {
-	fmt.Fprintln(w, "Usage: nml status [--run <id|path>] [--format toon]")
+	fmt.Fprintln(w, "Usage: nml status [flags]")
 	fmt.Fprintln(w, "Shows latest saved run state for the current repository.")
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --run <id|path>     run id or path (default: latest in repo)")
+	fmt.Fprintln(w, "  --format <toon>     output format (default: toon)")
+	fmt.Fprintln(w, "  --full              show full long fields (default: false)")
+	fmt.Fprintln(w, "Examples:")
+	fmt.Fprintln(w, "  nml status")
+	fmt.Fprintln(w, "  nml status --run <id>")
+	fmt.Fprintln(w, "  nml status --run <id> --full")
 }
 
 func printFindingsHelp(w io.Writer) {
-	fmt.Fprintln(w, "Usage: nml findings [--run <id|path>] [--format toon]")
+	fmt.Fprintln(w, "Usage: nml findings [flags]")
 	fmt.Fprintln(w, "Shows review findings recorded in a saved run.")
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --run <id|path>     run id or path (default: latest in repo)")
+	fmt.Fprintln(w, "  --format <toon>     output format (default: toon)")
+	fmt.Fprintln(w, "  --full              show full descriptions (default: false)")
+	fmt.Fprintln(w, "Examples:")
+	fmt.Fprintln(w, "  nml findings")
+	fmt.Fprintln(w, "  nml findings --run <id>")
+	fmt.Fprintln(w, "  nml findings --run <id> --full")
 }
 
 func printTUIHelp(w io.Writer) {
-	fmt.Fprintln(w, "Usage: nml tui [--run <id|path>]")
+	fmt.Fprintln(w, "Usage: nml tui [flags]")
 	fmt.Fprintln(w, "Shows a Bubble Tea timeline for the latest saved run.")
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --run <id|path>     run id or path (default: latest in repo)")
+	fmt.Fprintln(w, "Examples:")
+	fmt.Fprintln(w, "  nml tui")
+	fmt.Fprintln(w, "  nml tui --run <id>")
+}
+
+func printHooksHelp(w io.Writer) {
+	fmt.Fprintln(w, "Usage: nml hooks install [flags]")
+	fmt.Fprintln(w, "Installs or repairs agent session integrations that inject compact nml status.")
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --apps <list>       comma-separated apps: claude,codex,opencode (default: claude,codex,opencode)")
+	fmt.Fprintln(w, "  --scope <scope>     user or project (default: user)")
+	fmt.Fprintln(w, "Examples:")
+	fmt.Fprintln(w, "  nml hooks install")
+	fmt.Fprintln(w, "  nml hooks install --apps claude,codex")
+	fmt.Fprintln(w, "  nml hooks install --scope project --apps opencode")
 }
 
 func printResumeHelp(w io.Writer) {
-	fmt.Fprintln(w, "Usage: nml resume [--run <id|path>] [flags]")
+	fmt.Fprintln(w, "Usage: nml resume [flags]")
 	fmt.Fprintln(w, "Continues the latest failed or interrupted run from ~/.nml or the repo run store.")
 	fmt.Fprintln(w, "Flags:")
-	fmt.Fprintln(w, "  --run <id|path>        resume a specific run")
-	fmt.Fprintln(w, "  --yes                  accept safe defaults without prompts")
-	fmt.Fprintln(w, "  --yolo                 auto-fix all actionable review findings")
-	fmt.Fprintln(w, "  --skip-docs            skip docs for this resume")
-	fmt.Fprintln(w, "  --skip-deploy          skip deploy for this resume")
-	fmt.Fprintln(w, "  --ci-timeout <dur>     override CI timeout")
-	fmt.Fprintln(w, "  --test-command <cmd>   override test command for this resume only")
+	fmt.Fprintln(w, "  --run <id|path>        resume a specific run (default: latest resumable)")
+	fmt.Fprintln(w, "  --yes                  accept safe defaults without prompts (default: false)")
+	fmt.Fprintln(w, "  --yolo                 auto-fix all actionable review findings (default: false)")
+	fmt.Fprintln(w, "  --skip-docs            skip docs for this resume (default: false)")
+	fmt.Fprintln(w, "  --skip-deploy          skip deploy for this resume (default: false)")
+	fmt.Fprintln(w, "  --ci-timeout <dur>     override CI timeout (default: config value)")
+	fmt.Fprintln(w, "  --test-command <cmd>   override test command for this resume only (default: config value)")
+	fmt.Fprintln(w, "Examples:")
+	fmt.Fprintln(w, "  nml resume")
+	fmt.Fprintln(w, "  nml resume --run <id>")
+	fmt.Fprintln(w, "  nml resume --run <id> --test-command \"go test ./...\"")
 }
 
 func printRunsHelp(w io.Writer) {
-	fmt.Fprintln(w, "Usage: nml runs [--all] [--resumable]")
+	fmt.Fprintln(w, "Usage: nml runs [flags]")
 	fmt.Fprintln(w, "Lists saved run sessions mirrored under ~/.nml.")
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --all          show runs for all repositories (default: false)")
+	fmt.Fprintln(w, "  --resumable    show only failed or interrupted runs (default: false)")
+	fmt.Fprintln(w, "Examples:")
+	fmt.Fprintln(w, "  nml runs")
+	fmt.Fprintln(w, "  nml runs --resumable")
+	fmt.Fprintln(w, "  nml runs --all")
 }
 
 func printRespondHelp(w io.Writer) {
-	fmt.Fprintln(w, "Usage: nml respond --action <approve|skip|fix> [--findings r1,r2] [--run <id|path>]")
+	fmt.Fprintln(w, "Usage: nml respond --action <approve|skip|fix> [flags]")
 	fmt.Fprintln(w, "Answers a saved review gate and continues validation from the leased worktree.")
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --action <value>     approve, skip, or fix (required)")
+	fmt.Fprintln(w, "  --findings <ids>     comma-separated finding ids for --action fix (default: all latest findings)")
+	fmt.Fprintln(w, "  --run <id|path>      run id or path (default: latest in repo)")
+	fmt.Fprintln(w, "Examples:")
+	fmt.Fprintln(w, "  nml respond --action fix --findings r1,r2 --run <id>")
+	fmt.Fprintln(w, "  nml respond --action approve --run <id>")
+	fmt.Fprintln(w, "  nml respond --action skip --run <id>")
 }

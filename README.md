@@ -5,28 +5,43 @@
 ## Current commands
 
 ```sh
-nml                  # inspect repo and show the next action
-nml init             # create ~/.config/nml/config.yaml
-nml doctor           # check local tools, auth, config, and repo state
+nml                                  # print compact workspace status in TOON
+nml init --yes --agent <name>         # create ~/.config/nml/config.yaml
+nml init --interactive                # guided setup wizard for humans
+nml doctor                            # check local tools, auth, config, and repo state
 nml run --message "fix: handle empty input"
 nml run --test-command "go test ./..."
 nml status --format toon
+nml status --run <id> --full
 nml findings --format toon
+nml findings --run <id> --full
 nml runs --resumable
 nml resume --run <id>
 nml respond --action approve
-nml config --format yaml
+nml config --format toon
+nml hooks install --apps claude,codex,opencode
 nml tui
 ```
 
-Headless commands keep stdout structured and compact. Progress goes to stderr. Exit codes are 0 for success or no-op, 1 for runtime errors, and 2 for usage errors.
+Headless commands keep stdout structured and compact. Running `nml` with no arguments is content-first and never prompts. Progress goes to stderr. Exit codes are 0 for success or no-op, 1 for runtime errors, and 2 for usage errors.
+
+## Agent integrations
+
+Install live session context hooks when you want agents to see `nml` workspace status at startup:
+
+```sh
+nml hooks install --apps claude,codex,opencode
+nml hooks install --scope project --apps claude,codex
+```
+
+The repository also carries an Agent Skill at `skills/no-mistakes-lite/SKILL.md`. `scripts/install.sh` installs it to `~/.agents/skills/no-mistakes-lite/SKILL.md` alongside the binary. The hook and skill are complementary: use the hook for ambient live state, and the skill for on-demand workflow guidance.
 
 ## Implemented first
 
 - Go module and `nml` binary skeleton.
 - Global and per-repo config loading from `~/.config/nml`.
 - Git preflight classification and no-op exits.
-- First-run setup command with tool detection and TUI option pickers that support keyboard and mouse selection.
+- Non-interactive first-run setup with `--yes`, plus an explicit `--interactive` wizard for humans.
 - Doctor command with TOON output.
 - Dirty worktree staging, agent-generated commit metadata, and commit hook fix retries.
 - Agent or fallback intent generation and JSON run state under `.git/nml/runs`, mirrored to `~/.nml/runs` with event and log files for resume.
@@ -36,6 +51,6 @@ Headless commands keep stdout structured and compact. Progress goes to stderr. E
 - Docs evaluation and optional agent documentation updates.
 - GitHub remote detection, safe push of tool-owned `nml/*` branches, and GitHub PR create/update through `gh` when available.
 - Bounded CI watch, failed-log collection, persisted CI logs, agent CI fix retries, optional per-run auto-merge, and optional deploy command retries.
-- Resumable failed or interrupted runs via `nml resume`, review finding parser, secret redaction, PR body generation, Bubble Tea run timeline, install script, usage docs, and unit tests.
+- Resumable failed or interrupted runs via `nml resume`, review finding parser, secret redaction, PR body generation, Bubble Tea run timeline, AXI session hook installation for Claude Code, Codex, and OpenCode, installable Agent Skill copy, install script, usage docs, and unit tests.
 
 See `docs/usage.md` for workflow details. Future work is mostly provider expansion and richer TUI interactions.

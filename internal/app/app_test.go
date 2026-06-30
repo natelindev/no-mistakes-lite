@@ -21,8 +21,11 @@ func TestHomeNoRepoIsNoop(t *testing.T) {
 	if code != ExitOK {
 		t.Fatalf("expected exit 0, got %d", code)
 	}
-	if strings.TrimSpace(out.String()) != "Nothing to do: current directory is not inside a git repository." {
-		t.Fatalf("unexpected output: %q", out.String())
+	text := out.String()
+	for _, want := range []string{"bin:", "description:", "status: noop", "state: no_repo", "reason:"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("home output missing %q in:\n%s", want, text)
+		}
 	}
 }
 
@@ -38,7 +41,7 @@ func TestUnknownCommandIsUsageError(t *testing.T) {
 	}
 }
 
-func TestInteractiveHomeUsesPromptStyle(t *testing.T) {
+func TestInteractiveHomeStaysHeadless(t *testing.T) {
 	root := t.TempDir()
 	home := filepath.Join(root, "home")
 	t.Setenv("HOME", home)
@@ -60,10 +63,60 @@ func TestInteractiveHomeUsesPromptStyle(t *testing.T) {
 		t.Fatalf("expected exit 0, got %d", code)
 	}
 	text := out.String()
-	for _, want := range []string{"◆  NO MISTAKES LITE", "◇  Repository status", "│  State: dirty", "Validate dirty worktree"} {
+	for _, want := range []string{"bin:", "description:", "state: dirty", "status: actionable", "changed_files[1]:"} {
 		if !strings.Contains(text, want) {
-			t.Fatalf("interactive home missing %q in:\n%s", want, text)
+			t.Fatalf("home output missing %q in:\n%s", want, text)
 		}
+	}
+	if strings.Contains(text, "Choose next action") {
+		t.Fatalf("home must not prompt in AXI mode:\n%s", text)
+	}
+}
+
+func TestInitRequiresExplicitMode(t *testing.T) {
+	var out, errw bytes.Buffer
+	app := App{Out: &out, Err: &errw, Cwd: t.TempDir(), Interactive: true}
+	code := app.Run(context.Background(), []string{"init"})
+	if code != ExitUsage {
+		t.Fatalf("expected usage exit, got %d", code)
+	}
+	if !strings.Contains(out.String(), "init requires --yes or --interactive") {
+		t.Fatalf("unexpected output: %q", out.String())
+	}
+}
+
+func TestHooksInstallWritesUserIntegrations(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	var out, errw bytes.Buffer
+	app := App{Out: &out, Err: &errw, Cwd: t.TempDir(), Interactive: false}
+	code := app.Run(context.Background(), []string{"hooks", "install", "--apps", "claude,codex,opencode"})
+	if code != ExitOK {
+		t.Fatalf("expected exit 0, got %d\nstdout:\n%s\nstderr:\n%s", code, out.String(), errw.String())
+	}
+	for _, path := range []string{
+		filepath.Join(home, ".claude", "settings.json"),
+		filepath.Join(home, ".codex", "hooks.json"),
+		filepath.Join(home, ".codex", "config.toml"),
+		filepath.Join(home, ".config", "opencode", "plugins", "nml-context.js"),
+	} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected integration file %s: %v", path, err)
+		}
+	}
+	codexConfig, err := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(codexConfig), "hooks = true") {
+		t.Fatalf("codex config did not enable hooks:\n%s", codexConfig)
+	}
+	plugin, err := os.ReadFile(filepath.Join(home, ".config", "opencode", "plugins", "nml-context.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(plugin), "experimental.chat.system.transform") {
+		t.Fatalf("opencode plugin missing system transform:\n%s", plugin)
 	}
 }
 

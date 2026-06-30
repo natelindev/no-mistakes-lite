@@ -3,13 +3,14 @@
 ## Quick start
 
 ```sh
-nml init
+nml
+nml init --yes --agent <name>
 nml doctor
 nml run --message "fix: handle empty input"
 nml run --test-command "go test ./..."
 ```
 
-First-run setup uses one consistent prompt-style TUI for both option pickers and text inputs. Move pickers with `j/k` or arrow keys, press `space` or `enter` to select, or click an option with the mouse. Text inputs accept with `enter` and clear with `ctrl+u`. Press `ctrl+c`, `ctrl+d`, `esc`, or `q` to cancel setup where shown.
+First-run setup is non-interactive by default for agents. Use `nml init --yes --agent <name>` in automation. Humans can run `nml init --interactive` for the guided prompt-style wizard with keyboard and mouse selection.
 
 Test commands have no auto-detected default. If no per-repo test command is configured and no `--test-command` is supplied for the run, the test step is skipped with a reason.
 
@@ -19,7 +20,7 @@ Configure a repo-specific test command:
 nml config --set-test-command "go test ./..."
 ```
 
-`nml` writes structured output to stdout and progress to stderr. Headless commands use compact TOON tables and return exit code 0 for success or no-op, 1 for runtime errors, and 2 for usage errors.
+`nml` writes structured output to stdout and progress to stderr. Running `nml` with no arguments prints a compact TOON dashboard and never prompts. Headless commands use compact TOON tables and return exit code 0 for success or no-op, 1 for runtime errors, and 2 for usage errors.
 
 ## Pipeline
 
@@ -52,14 +53,24 @@ nml resume --run <id>
 
 ## Review gates
 
-When review finds issues in interactive mode, answer the saved gate:
+When review finds issues, answer the saved gate:
 
 ```sh
 nml findings --run <id> --format toon
+nml findings --run <id> --full
 nml respond --action fix --findings r1,r2 --run <id>
 nml respond --action approve --run <id>
 nml respond --action skip --run <id>
 ```
+
+## Agent integrations
+
+```sh
+nml hooks install --apps claude,codex,opencode
+nml hooks install --scope project --apps claude,codex
+```
+
+The hook runs `nml` at session start so supported agents see live workspace state. The install script also copies the Agent Skill from `skills/no-mistakes-lite/SKILL.md` to `~/.agents/skills/no-mistakes-lite/SKILL.md`.
 
 ## TUI
 
@@ -68,4 +79,4 @@ nml tui
 nml tui --run <id>
 ```
 
-The default interactive `nml` home view, setup wizard, commit-message input, review gate, and run timeline all use the same `◆`, `◇`, `│`, `◻`, and `└` prompt style. From the home view, choose an action with `space`, `enter`, or a mouse click. Dirty worktree runs ask for the commit message inside the same TUI flow. Long-running operations show a CLI spinner with the current step, such as `review round 1`, `running test`, `pushing review branch`, or `watching CI`. Running and fixing steps animate with spinner frames. Press `q`, `esc`, `ctrl+c`, or `ctrl+d` to quit where shown.
+The explicit TUI command shows the saved run timeline with the same `◆`, `◇`, `│`, `◻`, and `└` prompt style. Long-running operations show progress on stderr with the current step, such as `review round 1`, `running test`, `pushing review branch`, or `watching CI`. Running and fixing steps animate with spinner frames. Press `q`, `esc`, `ctrl+c`, or `ctrl+d` to quit where shown.
