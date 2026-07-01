@@ -64,6 +64,10 @@ type DeployConfig struct {
 	When    string `yaml:"when" json:"when"`
 }
 
+type CleanupConfig struct {
+	Auto bool `yaml:"auto" json:"auto"`
+}
+
 type Config struct {
 	Agent      AgentConfig     `yaml:"agent" json:"agent"`
 	MainBranch string          `yaml:"main_branch" json:"main_branch"`
@@ -75,6 +79,7 @@ type Config struct {
 	AutoMerge  AutoMergeConfig `yaml:"auto_merge" json:"auto_merge"`
 	Docs       DocsConfig      `yaml:"docs" json:"docs"`
 	Deploy     DeployConfig    `yaml:"deploy" json:"deploy"`
+	Cleanup    CleanupConfig   `yaml:"cleanup" json:"cleanup"`
 }
 
 type Paths struct {
@@ -114,6 +119,7 @@ func Defaults() Config {
 		AutoMerge: AutoMergeConfig{Method: "squash"},
 		Docs:      DocsConfig{Enabled: true},
 		Deploy:    DeployConfig{Enabled: false, When: "after_ci"},
+		Cleanup:   CleanupConfig{Auto: true},
 	}
 }
 
@@ -129,6 +135,7 @@ type RawConfig struct {
 	AutoMerge  *RawAutoMergeConfig `yaml:"auto_merge"`
 	Docs       *RawDocsConfig      `yaml:"docs"`
 	Deploy     *RawDeployConfig    `yaml:"deploy"`
+	Cleanup    *RawCleanupConfig   `yaml:"cleanup"`
 }
 
 type RawAgentConfig struct {
@@ -174,6 +181,10 @@ type RawDeployConfig struct {
 	Enabled *bool   `yaml:"enabled"`
 	Command *string `yaml:"command"`
 	When    *string `yaml:"when"`
+}
+
+type RawCleanupConfig struct {
+	Auto *bool `yaml:"auto"`
 }
 
 func ResolvePaths(repoRoot string) (Paths, error) {
@@ -368,6 +379,11 @@ func Apply(cfg *Config, raw RawConfig) {
 			cfg.Deploy.When = *raw.Deploy.When
 		}
 	}
+	if raw.Cleanup != nil {
+		if raw.Cleanup.Auto != nil {
+			cfg.Cleanup.Auto = *raw.Cleanup.Auto
+		}
+	}
 }
 
 func SaveGlobal(cfg Config) (string, error) {
@@ -449,6 +465,12 @@ func parseSetting(key, value string) (any, string, error) {
 			return nil, "", fmt.Errorf("auto_merge.method must be squash, merge, or rebase")
 		}
 		return value, key, nil
+	case "auto_cleanup", "cleanup.auto":
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return nil, "", fmt.Errorf("%s must be true or false", key)
+		}
+		return parsed, "cleanup.auto", nil
 	case "ci.timeout":
 		if _, err := time.ParseDuration(value); err != nil {
 			return nil, "", fmt.Errorf("ci.timeout must be a duration like 15m: %w", err)

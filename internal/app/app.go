@@ -368,7 +368,7 @@ func (a App) run(ctx context.Context, args []string) int {
 		toon.Error(a.Out, "worktree preparation failed", append(help, redact.Secrets(err.Error())))
 		return ExitError
 	}
-	run.SetStep("worktree", runstate.StatusCompleted, fmt.Sprintf("leased %s, copied %d commits with %s", prep.Path, prep.CommitCount, prep.Method))
+	run.SetStep("worktree", runstate.StatusCompleted, worktreePrepDetail(prep))
 	reviewOutcome, err := a.runReview(ctx, cfg, opts, &run)
 	if err != nil {
 		run.SetStep("review", runstate.StatusFailed, redact.Secrets(err.Error()))
@@ -412,6 +412,7 @@ func (a App) run(ctx context.Context, args []string) int {
 		toon.Error(a.Out, err.Error(), nil)
 		return ExitError
 	}
+	a.cleanupRunWorktree(ctx, cfg, run)
 	printRunPrepared(a.Out, run, path)
 	return ExitOK
 }
@@ -569,7 +570,18 @@ type worktreePrep struct {
 	Method      string
 }
 
+func worktreePrepDetail(prep worktreePrep) string {
+	action := "leased"
+	if prep.Method == "source-worktree" {
+		action = "reused current treehouse worktree"
+	}
+	return fmt.Sprintf("%s %s, copied %d commits with %s", action, prep.Path, prep.CommitCount, prep.Method)
+}
+
 func (a App) prepareWorktree(ctx context.Context, cfg config.Config, source gitx.Client, treehousePath string, run *runstate.State) (worktreePrep, error) {
+	if sourceTreehousePath, ok := treehouse.ManagedWorktreeRoot(run.RepoRoot); ok {
+		return a.prepareSourceTreehouseWorktree(ctx, source, sourceTreehousePath, run)
+	}
 	th := treehouse.New(treehousePath, run.RepoRoot)
 	var worktreePath string
 	err := a.withSpinner(ctx, "leasing treehouse worktree", func() error {
@@ -593,15 +605,22 @@ func (a App) prepareWorktree(ctx context.Context, cfg config.Config, source gitx
 	if !target.RefExists(ctx, run.BaseRef) {
 		return worktreePrep{Path: worktreePath}, fmt.Errorf("base ref %s is not available in leased worktree", run.BaseRef)
 	}
-	if err := a.withSpinner(ctx, "checking out review branch", func() error { return target.CheckoutBranch(ctx, run.ReviewBranch, run.BaseRef) }); err != nil {
-		return worktreePrep{Path: worktreePath}, err
-	}
 	commits, err := source.OrderedRange(ctx, run.BaseRef)
 	if err != nil {
 		return worktreePrep{Path: worktreePath}, err
 	}
 	if len(commits) == 0 {
 		return worktreePrep{Path: worktreePath}, fmt.Errorf("no commits found in range %s..HEAD", run.BaseRef)
+	}
+	if err := a.withSpinner(ctx, fmt.Sprintf("copying %d source commits into isolated worktree", len(commits)), func() error {
+		return checkoutSourceHead(ctx, target, source, run.ReviewBranch, run.SourceHead)
+	}); err == nil {
+		return worktreePrep{Path: worktreePath, CommitCount: len(commits), Method: "source-head"}, nil
+	} else {
+		a.warn("source commit reuse failed, trying cherry-pick: %v", err)
+	}
+	if err := a.withSpinner(ctx, "checking out review branch", func() error { return target.CheckoutBranch(ctx, run.ReviewBranch, run.BaseRef) }); err != nil {
+		return worktreePrep{Path: worktreePath}, err
 	}
 	if err := a.withSpinner(ctx, fmt.Sprintf("copying %d commits into isolated worktree", len(commits)), func() error { return target.CherryPick(ctx, commits) }); err == nil {
 		return worktreePrep{Path: worktreePath, CommitCount: len(commits), Method: "cherry-pick"}, nil
@@ -628,6 +647,64 @@ func (a App) prepareWorktree(ctx context.Context, cfg config.Config, source gitx
 		}
 		return worktreePrep{Path: worktreePath, CommitCount: len(commits), Method: "format-patch"}, nil
 	}
+}
+
+func (a App) prepareSourceTreehouseWorktree(ctx context.Context, source gitx.Client, worktreePath string, run *runstate.State) (worktreePrep, error) {
+	worktreePath = strings.TrimSpace(worktreePath)
+	if worktreePath == "" {
+		return worktreePrep{}, fmt.Errorf("source treehouse worktree path is empty")
+	}
+	run.WorktreePath = worktreePath
+	a.progress("reusing current treehouse worktree %s", worktreePath)
+	if err := a.withSpinner(ctx, "fetching base branch in current treehouse worktree", func() error { return source.Fetch(ctx, run.Remote, run.MainBranch) }); err != nil {
+		a.warn("worktree fetch failed: %v", err)
+	}
+	if !source.RefExists(ctx, run.BaseRef) {
+		return worktreePrep{Path: worktreePath}, fmt.Errorf("base ref %s is not available in current treehouse worktree", run.BaseRef)
+	}
+	commits, err := source.OrderedRange(ctx, run.BaseRef)
+	if err != nil {
+		return worktreePrep{Path: worktreePath}, err
+	}
+	if len(commits) == 0 {
+		return worktreePrep{Path: worktreePath}, fmt.Errorf("no commits found in range %s..HEAD", run.BaseRef)
+	}
+	head := strings.TrimSpace(run.SourceHead)
+	if head == "" {
+		head, err = source.Head(ctx)
+		if err != nil {
+			return worktreePrep{Path: worktreePath, CommitCount: len(commits)}, err
+		}
+	}
+	if err := a.withSpinner(ctx, "checking out review branch in current treehouse worktree", func() error { return source.CheckoutBranch(ctx, run.ReviewBranch, head) }); err != nil {
+		return worktreePrep{Path: worktreePath, CommitCount: len(commits)}, err
+	}
+	return worktreePrep{Path: worktreePath, CommitCount: len(commits), Method: "source-worktree"}, nil
+}
+
+func checkoutSourceHead(ctx context.Context, target, source gitx.Client, reviewBranch, sourceHead string) error {
+	sourceDir := strings.TrimSpace(source.Dir)
+	if sourceDir == "" {
+		return fmt.Errorf("source git directory is required")
+	}
+	if strings.TrimSpace(sourceHead) == "" {
+		var err error
+		sourceHead, err = source.Head(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	if _, err := target.Run(ctx, "fetch", "--quiet", sourceDir, "HEAD"); err != nil {
+		return err
+	}
+	out, err := target.Run(ctx, "rev-parse", "FETCH_HEAD")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(out) != strings.TrimSpace(sourceHead) {
+		return fmt.Errorf("fetched source HEAD %s, expected %s", strings.TrimSpace(out), strings.TrimSpace(sourceHead))
+	}
+	return target.CheckoutBranch(ctx, reviewBranch, "FETCH_HEAD")
 }
 
 func (a App) fixMailboxConflicts(ctx context.Context, cfg config.Config, run *runstate.State, applyErr error) error {
@@ -1303,6 +1380,67 @@ func (a App) runPushAndPR(ctx context.Context, cfg config.Config, opts runOption
 	}
 	run.SetStep("final", runstate.StatusCompleted, "pipeline completed")
 	return nil
+}
+
+func (a App) cleanupRunWorktree(ctx context.Context, cfg config.Config, run runstate.State) {
+	if !cfg.Cleanup.Auto || strings.TrimSpace(run.WorktreePath) == "" {
+		return
+	}
+	treehousePath, ok := treehouse.Detect()
+	if !ok {
+		a.warn("auto-cleanup skipped because treehouse is unavailable")
+		return
+	}
+	chdirAwayFrom(run.WorktreePath)
+	client := treehouse.New(treehousePath, "")
+	if err := client.Return(ctx, run.WorktreePath, true); err != nil {
+		a.warn("auto-cleanup failed for %s: %v", run.WorktreePath, err)
+		return
+	}
+	a.progress("auto-cleaned treehouse worktree %s", run.WorktreePath)
+}
+
+func chdirAwayFrom(path string) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return
+	}
+	cwd, err := os.Getwd()
+	if err != nil || !pathWithin(cwd, path) {
+		return
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		if !pathWithin(home, path) && os.Chdir(home) == nil {
+			return
+		}
+	}
+	_ = os.Chdir(string(filepath.Separator))
+}
+
+func pathWithin(path, root string) bool {
+	path = cleanAbs(path)
+	root = cleanAbs(root)
+	if path == "" || root == "" {
+		return false
+	}
+	if path == root {
+		return true
+	}
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != "." && !strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel)
+}
+
+func cleanAbs(path string) string {
+	if path == "" {
+		return ""
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	if realPath, err := filepath.EvalSymlinks(path); err == nil {
+		path = realPath
+	}
+	return filepath.Clean(path)
 }
 
 func (a App) runCIWatch(ctx context.Context, cfg config.Config, opts runOptions, run *runstate.State, ghPath string) error {
@@ -2019,6 +2157,7 @@ func (a App) init(ctx context.Context, args []string) int {
 		{"ci.timeout", cfg.CI.Timeout},
 		{"auto_merge.enabled", fmt.Sprint(cfg.AutoMerge.Enabled)},
 		{"auto_merge.method", cfg.AutoMerge.Method},
+		{"cleanup.auto", fmt.Sprint(cfg.Cleanup.Auto)},
 	})
 	return ExitOK
 }
@@ -2202,6 +2341,7 @@ func (a App) config(ctx context.Context, args []string) int {
 			{"ci.timeout", cfg.CI.Timeout},
 			{"auto_merge.enabled", fmt.Sprint(cfg.AutoMerge.Enabled)},
 			{"auto_merge.method", cfg.AutoMerge.Method},
+			{"cleanup.auto", fmt.Sprint(cfg.Cleanup.Auto)},
 		})
 	default:
 		toon.Error(a.Out, "invalid --format: "+format, []string{"Use `--format yaml` or `--format toon`."})
@@ -2240,6 +2380,10 @@ func (a App) configInteractive(ctx context.Context, repoRoot string) int {
 	if cancelled {
 		return a.setupCancelled()
 	}
+	cleanupAuto, cancelled := a.promptChoice(ctx, "Auto-cleanup treehouse worktrees", fmt.Sprint(cfg.Cleanup.Auto), []string{"true", "false"})
+	if cancelled {
+		return a.setupCancelled()
+	}
 	ciTimeout, cancelled := a.promptWizard(ctx, "CI timeout", cfg.CI.Timeout)
 	if cancelled {
 		return a.setupCancelled()
@@ -2256,6 +2400,7 @@ func (a App) configInteractive(ctx context.Context, repoRoot string) int {
 		"review.yolo":        yolo,
 		"auto_merge.enabled": autoMerge,
 		"auto_merge.method":  mergeMethod,
+		"cleanup.auto":       cleanupAuto,
 		"ci.timeout":         ciTimeout,
 		"commands.test":      testCommand,
 		"commands.lint":      lintCommand,
@@ -2272,6 +2417,7 @@ func (a App) configInteractive(ctx context.Context, repoRoot string) int {
 		{"review.yolo", yolo},
 		{"auto_merge.enabled", autoMerge},
 		{"auto_merge.method", mergeMethod},
+		{"cleanup.auto", cleanupAuto},
 		{"ci.timeout", ciTimeout},
 		{"commands.test", testCommand},
 		{"commands.lint", lintCommand},
@@ -2607,6 +2753,7 @@ func (a App) continueRun(ctx context.Context, options cfgLoadOptions, state runs
 		toon.Error(a.Out, err.Error(), nil)
 		return ExitError
 	}
+	a.cleanupRunWorktree(ctx, cfg, state)
 	printRunPrepared(a.Out, state, path)
 	return ExitOK
 }
@@ -2770,6 +2917,7 @@ func (a App) applyReviewGateResponse(ctx context.Context, path string, state run
 		toon.Error(a.Out, err.Error(), nil)
 		return ExitError
 	}
+	a.cleanupRunWorktree(ctx, cfg, state)
 	printRunPrepared(a.Out, state, path)
 	return ExitOK
 }
@@ -3395,7 +3543,7 @@ func printRunPrepared(w io.Writer, state runstate.State, path string) {
 	rows, stepTruncated := stepRows(state, false)
 	truncated = truncated || stepTruncated
 	toon.Table(w, "steps", []string{"name", "status", "detail"}, rows)
-	help := []string{"Inspect this run with `nml status --run " + state.ID + "`.", "Return the lease manually with `treehouse return " + state.WorktreePath + " --force` if you want to clean up."}
+	help := []string{"Inspect this run with `nml status --run " + state.ID + "`.", "If cleanup.auto is false, return the lease manually with `treehouse return " + state.WorktreePath + " --force` when you are done."}
 	if truncated {
 		help = append(help, "Run `nml status --run "+state.ID+" --full` to see complete long fields.")
 	}
@@ -3859,6 +4007,7 @@ func printConfigHelp(w io.Writer) {
 	fmt.Fprintln(w, "  review.yolo=true|false")
 	fmt.Fprintln(w, "  auto_merge.enabled=true|false")
 	fmt.Fprintln(w, "  auto_merge.method=squash|merge|rebase")
+	fmt.Fprintln(w, "  cleanup.auto=true|false")
 	fmt.Fprintln(w, "  ci.timeout=<duration>")
 	fmt.Fprintln(w, "  commands.test=<cmd>")
 	fmt.Fprintln(w, "  commands.lint=<cmd>")
@@ -3867,6 +4016,7 @@ func printConfigHelp(w io.Writer) {
 	fmt.Fprintln(w, "  nml config --interactive")
 	fmt.Fprintln(w, "  nml config --scope project --set review.yolo=true --set ci.timeout=15m")
 	fmt.Fprintln(w, "  nml config --scope global --set auto_merge.enabled=true")
+	fmt.Fprintln(w, "  nml config --scope project --set cleanup.auto=false")
 	fmt.Fprintln(w, "  nml config --set-test-command \"go test ./...\"")
 }
 

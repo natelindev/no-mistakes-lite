@@ -32,10 +32,11 @@ preflight -> intent -> commit -> worktree -> review -> test -> docs -> lint -> p
 
 - Dirty work is staged and committed first.
 - Intent is stored before agent fixes mutate the change.
-- A treehouse lease provides the isolated review worktree.
+- A treehouse lease provides the isolated review worktree unless the command is already running inside a Treehouse-managed worktree, in which case nml reuses the current worktree.
 - Review uses exact `LGTM` or Markdown findings. PR bodies include the actual review findings for every non-LGTM round.
 - Tests, docs, lint, CI, and deploy can ask the configured agent for fixes. PR bodies summarize only each command and final status, not full command output.
 - Auto-merge means nml runs `gh pr merge` after checks pass. It does not use GitHub's repository-level auto-merge feature.
+- Cleanup auto-return is enabled by default. After a completed run, nml returns the Treehouse worktree with `treehouse return --force`. Set `cleanup.auto=false` to keep completed worktrees for inspection.
 
 ## Resuming runs
 
@@ -75,11 +76,12 @@ Persist run defaults globally or for the current project. Project settings overr
 nml config --interactive
 nml config --scope project --set review.yolo=true --set ci.timeout=15m
 nml config --scope project --set auto_merge.enabled=true --set auto_merge.method=squash
+nml config --scope project --set cleanup.auto=false
 nml config --scope global --set review.yolo=false --set ci.timeout=30m
 nml config --format toon
 ```
 
-`nml config --interactive` starts with a scope picker, then prompts for yolo review fixing, auto-merge, merge method, CI timeout, test command, and lint command. Supported non-interactive keys are `review.yolo`, `auto_merge.enabled`, `auto_merge.method`, `ci.timeout`, `commands.test`, and `commands.lint`. CLI flags still override persisted defaults for that invocation.
+`nml config --interactive` starts with a scope picker, then prompts for yolo review fixing, auto-merge, merge method, auto-cleanup, CI timeout, test command, and lint command. Supported non-interactive keys are `review.yolo`, `auto_merge.enabled`, `auto_merge.method`, `cleanup.auto`, `ci.timeout`, `commands.test`, and `commands.lint`. CLI flags still override persisted defaults for that invocation.
 
 ## Agent integrations
 
@@ -88,7 +90,7 @@ nml hooks install --apps claude,codex,opencode
 nml hooks install --scope project --apps claude,codex
 ```
 
-The hook runs `nml` at session start so supported agents see live workspace state. The install script also copies the Agent Skill from `skills/no-mistakes-lite/SKILL.md` to `~/.agents/skills/no-mistakes-lite/SKILL.md`.
+The hook runs `nml` at session start so supported agents see live workspace state. The install script installs only the `nml` binary and does not copy the Agent Skill automatically. If you want the skill, install or copy `skills/no-mistakes-lite/SKILL.md` explicitly.
 
 ## TUI
 

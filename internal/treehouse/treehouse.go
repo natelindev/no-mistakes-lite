@@ -3,6 +3,7 @@ package treehouse
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -41,6 +42,37 @@ func New(path, dir string) Client {
 		path, _ = exec.LookPath("treehouse")
 	}
 	return Client{Path: path, Dir: dir}
+}
+
+func ManagedWorktreeRoot(repoRoot string) (string, bool) {
+	repoRoot = cleanPath(repoRoot)
+	if repoRoot == "" {
+		return "", false
+	}
+	for dir := repoRoot; ; dir = filepath.Dir(dir) {
+		statePath := filepath.Join(dir, "treehouse-state.json")
+		data, err := os.ReadFile(statePath)
+		if err == nil {
+			var state struct {
+				Worktrees []struct {
+					Path string `json:"path"`
+				} `json:"worktrees"`
+			}
+			if json.Unmarshal(data, &state) == nil {
+				for _, wt := range state.Worktrees {
+					path := cleanPath(wt.Path)
+					if path != "" && samePath(path, repoRoot) {
+						return path, true
+					}
+				}
+			}
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+	}
+	return "", false
 }
 
 func (c Client) Lease(ctx context.Context, holder string) (string, error) {
@@ -112,6 +144,29 @@ func expandHome(path string) (string, error) {
 		path = filepath.Join(home, strings.TrimPrefix(path, "~/"))
 	}
 	return filepath.Clean(path), nil
+}
+
+func cleanPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if strings.HasPrefix(path, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			path = filepath.Join(home, strings.TrimPrefix(path, "~/"))
+		}
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	if realPath, err := filepath.EvalSymlinks(path); err == nil {
+		path = realPath
+	}
+	return filepath.Clean(path)
+}
+
+func samePath(a, b string) bool {
+	return cleanPath(a) == cleanPath(b)
 }
 
 func (c Client) run(ctx context.Context, args ...string) (string, error) {

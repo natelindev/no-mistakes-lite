@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -444,7 +445,7 @@ esac
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	configData := "agent:\n  name: pi\n  path_overrides:\n    pi: " + fakePi + "\nreview:\n  rounds: 1\ncommands:\n  lint: git diff --quiet\nmain_branch: main\nremote: origin\n"
+	configData := "agent:\n  name: pi\n  path_overrides:\n    pi: " + fakePi + "\nreview:\n  rounds: 1\ncommands:\n  lint: git diff --quiet\ncleanup:\n  auto: false\nmain_branch: main\nremote: origin\n"
 	if err := os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte(configData), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -473,6 +474,7 @@ esac
 	}
 	runGitAppTest(t, repo, "add", "file.txt")
 	runGitAppTest(t, repo, "commit", "-m", "feat: change file")
+	sourceHead := strings.TrimSpace(runGitAppTestOutput(t, repo, "rev-parse", "HEAD"))
 
 	var out, errw bytes.Buffer
 	app := App{Out: &out, Err: &errw, Cwd: repo, Interactive: false}
@@ -506,6 +508,136 @@ esac
 	branch := strings.TrimSpace(runGitAppTestOutput(t, worktreePath, "branch", "--show-current"))
 	if !strings.HasPrefix(branch, "nml/") {
 		t.Fatalf("expected nml review branch, got %q", branch)
+	}
+	reviewHead := strings.TrimSpace(runGitAppTestOutput(t, worktreePath, "rev-parse", "HEAD"))
+	if reviewHead != sourceHead {
+		t.Fatalf("expected review branch to reuse source commit %s, got %s", sourceHead, reviewHead)
+	}
+}
+
+func TestCleanupRunWorktreeReturnsTreehouseLease(t *testing.T) {
+	root := t.TempDir()
+	fakeBin := filepath.Join(root, "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(root, "return.log")
+	fakeTreehouse := filepath.Join(fakeBin, "treehouse")
+	script := `#!/bin/sh
+set -eu
+case "${1:-}" in
+  return)
+    printf '%s %s\n' "$2" "${3:-}" > "$NML_RETURN_LOG"
+    ;;
+  *)
+    echo "unexpected treehouse command: $*" >&2
+    exit 2
+    ;;
+esac
+`
+	if err := os.WriteFile(fakeTreehouse, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldPath := os.Getenv("PATH")
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+oldPath)
+	t.Setenv("NML_RETURN_LOG", logPath)
+	worktree := filepath.Join(root, "worktree")
+	if err := os.MkdirAll(worktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults()
+	state := runstate.New(root, "feature/test", "main", "origin", "abc", "origin/main")
+	state.WorktreePath = worktree
+	app := App{Out: &bytes.Buffer{}, Err: &bytes.Buffer{}, Cwd: root, Interactive: false}
+	app.cleanupRunWorktree(context.Background(), cfg, state)
+	content, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(content)) != worktree+" --force" {
+		t.Fatalf("unexpected return command: %q", content)
+	}
+}
+
+func TestRunReusesCurrentTreehouseWorktree(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	fakeBin := filepath.Join(root, "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeTreehouse := filepath.Join(fakeBin, "treehouse")
+	script := `#!/bin/sh
+set -eu
+case "${1:-}" in
+  get)
+    echo "treehouse get should not run from a managed worktree" >&2
+    exit 2
+    ;;
+  return)
+    exit 0
+    ;;
+  *)
+    echo "unexpected treehouse command: $*" >&2
+    exit 2
+    ;;
+esac
+`
+	if err := os.WriteFile(fakeTreehouse, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakePi := filepath.Join(fakeBin, "pi")
+	if err := os.WriteFile(fakePi, []byte("#!/bin/sh\ncat >/dev/null\necho LGTM\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configDir := filepath.Join(home, ".config", "nml")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configData := "agent:\n  name: pi\n  path_overrides:\n    pi: " + fakePi + "\nreview:\n  rounds: 1\ncleanup:\n  auto: false\nmain_branch: main\nremote: origin\n"
+	if err := os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte(configData), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldPath := os.Getenv("PATH")
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+oldPath)
+	t.Setenv("HOME", home)
+
+	pool := filepath.Join(root, "pool")
+	repo := filepath.Join(pool, "1", "repo")
+	repo = newAppTestRepo(t, repo)
+	quoted, err := json.Marshal(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := `{"worktrees":[{"name":"1","path":` + string(quoted) + `}]}`
+	if err := os.WriteFile(filepath.Join(pool, "treehouse-state.json"), []byte(state), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGitAppTest(t, repo, "checkout", "-b", "feature/current-treehouse")
+	if err := os.WriteFile(filepath.Join(repo, "file.txt"), []byte("treehouse\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAppTest(t, repo, "add", "file.txt")
+	runGitAppTest(t, repo, "commit", "-m", "feat: current treehouse")
+	sourceHead := strings.TrimSpace(runGitAppTestOutput(t, repo, "rev-parse", "HEAD"))
+
+	var out, errw bytes.Buffer
+	app := App{Out: &out, Err: &errw, Cwd: repo, Interactive: false}
+	code := app.Run(context.Background(), []string{"run", "--fetch=false", "--test-command", "grep -q treehouse file.txt"})
+	if code != ExitOK {
+		t.Fatalf("expected exit 0, got %d\nstdout:\n%s\nstderr:\n%s", code, out.String(), errw.String())
+	}
+	worktreePath := valueFromTOONLine(out.String(), "worktree_path")
+	if cleanAbs(worktreePath) != cleanAbs(repo) {
+		t.Fatalf("expected current worktree path %q, got %q\n%s", cleanAbs(repo), cleanAbs(worktreePath), out.String())
+	}
+	branch := strings.TrimSpace(runGitAppTestOutput(t, repo, "branch", "--show-current"))
+	if !strings.HasPrefix(branch, "nml/") {
+		t.Fatalf("expected nml review branch, got %q", branch)
+	}
+	reviewHead := strings.TrimSpace(runGitAppTestOutput(t, repo, "rev-parse", "HEAD"))
+	if reviewHead != sourceHead {
+		t.Fatalf("expected reused source commit %s, got %s", sourceHead, reviewHead)
 	}
 }
 

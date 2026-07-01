@@ -1,6 +1,8 @@
 package treehouse
 
 import (
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -35,5 +37,28 @@ func TestParseLeasePathBannerOnly(t *testing.T) {
 	want := filepath.Join(home, ".treehouse", "repo", "1", "repo")
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestManagedWorktreeRootFindsTreehouseState(t *testing.T) {
+	pool := filepath.Join(t.TempDir(), "pool")
+	worktree := filepath.Join(pool, "1", "repo")
+	if err := os.MkdirAll(worktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	quoted, err := json.Marshal(worktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := `{"worktrees":[{"name":"1","path":` + string(quoted) + `}]}`
+	if err := os.WriteFile(filepath.Join(pool, "treehouse-state.json"), []byte(state), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := ManagedWorktreeRoot(worktree)
+	if !ok {
+		t.Fatal("expected managed worktree detection")
+	}
+	if got != cleanPath(worktree) {
+		t.Fatalf("got %q, want %q", got, cleanPath(worktree))
 	}
 }

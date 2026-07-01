@@ -30,14 +30,20 @@ func TestDefaults(t *testing.T) {
 	if cfg.AutoMerge.Method != "squash" {
 		t.Fatalf("unexpected merge method: %s", cfg.AutoMerge.Method)
 	}
+	if !cfg.Cleanup.Auto {
+		t.Fatal("cleanup.auto should default true")
+	}
 }
 
 func TestApplyCanOverrideBoolFalse(t *testing.T) {
 	cfg := Defaults()
 	falseValue := false
-	Apply(&cfg, RawConfig{Docs: &RawDocsConfig{Enabled: &falseValue}})
+	Apply(&cfg, RawConfig{Docs: &RawDocsConfig{Enabled: &falseValue}, Cleanup: &RawCleanupConfig{Auto: &falseValue}})
 	if cfg.Docs.Enabled {
 		t.Fatal("expected docs.enabled false override")
+	}
+	if cfg.Cleanup.Auto {
+		t.Fatal("expected cleanup.auto false override")
 	}
 }
 
@@ -146,6 +152,7 @@ func TestSaveScopedSettingsSupportsGlobalAndProject(t *testing.T) {
 	if _, err := SaveScopedSettings("", "global", map[string]string{
 		"review.yolo":        "true",
 		"auto_merge.enabled": "true",
+		"cleanup.auto":       "false",
 		"ci.timeout":         "15m",
 	}); err != nil {
 		t.Fatal(err)
@@ -169,5 +176,8 @@ func TestSaveScopedSettingsSupportsGlobalAndProject(t *testing.T) {
 	}
 	if !cfgB.AutoMerge.Enabled {
 		t.Fatal("repo B should inherit global auto merge")
+	}
+	if cfgB.Cleanup.Auto {
+		t.Fatal("repo B should inherit global cleanup.auto false")
 	}
 }
