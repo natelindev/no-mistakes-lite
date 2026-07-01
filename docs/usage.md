@@ -35,6 +35,7 @@ preflight -> intent -> commit -> worktree -> review -> test -> docs -> lint -> p
 - A treehouse lease provides the isolated review worktree unless the command is already running inside a Treehouse-managed worktree, in which case nml reuses the current worktree.
 - Review uses exact `LGTM` or Markdown findings. PR bodies include the actual review findings for every non-LGTM round.
 - Tests, docs, lint, CI, and deploy can ask the configured agent for fixes. PR bodies summarize only each command and final status, not full command output.
+- Completed runs print a compact summary with PR URL, cleanup status, and step statuses. Use `nml status --run <id>` or `nml status --run <id> --full` for step details and logs.
 - Auto-merge means nml runs `gh pr merge` after checks pass. It does not use GitHub's repository-level auto-merge feature.
 - Cleanup auto-return is enabled by default. After a completed run, nml returns the Treehouse worktree with `treehouse return --force`. Set `cleanup.auto=false` to keep completed worktrees for inspection.
 

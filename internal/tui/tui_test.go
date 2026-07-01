@@ -6,9 +6,9 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/mattn/go-runewidth"
 	"github.com/natelindev/no-mistakes-lite/internal/review"
 	"github.com/natelindev/no-mistakes-lite/internal/runstate"
-	"github.com/mattn/go-runewidth"
 )
 
 func TestSelectModelSpaceSelectsCursor(t *testing.T) {

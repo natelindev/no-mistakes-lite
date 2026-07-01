@@ -494,6 +494,15 @@ esac
 	if !strings.Contains(out.String(), "pr,completed") || !strings.Contains(out.String(), "ci,completed") {
 		t.Fatalf("expected completed PR and CI steps, got:\n%s", out.String())
 	}
+	if !strings.Contains(out.String(), "pr_url: \"https://github.com/owner/repo/pull/1\"") {
+		t.Fatalf("expected PR URL in compact completion output, got:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "cleanup: manual") {
+		t.Fatalf("expected manual cleanup status, got:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "grep -q feature file.txt") || strings.Contains(out.String(), "All checks were successful") {
+		t.Fatalf("expected compact completion output without command logs, got:\n%s", out.String())
+	}
 	worktreePath := valueFromTOONLine(out.String(), "worktree_path")
 	if worktreePath == "" {
 		t.Fatalf("worktree_path missing from output:\n%s", out.String())
@@ -548,8 +557,15 @@ esac
 	cfg := config.Defaults()
 	state := runstate.New(root, "feature/test", "main", "origin", "abc", "origin/main")
 	state.WorktreePath = worktree
-	app := App{Out: &bytes.Buffer{}, Err: &bytes.Buffer{}, Cwd: root, Interactive: false}
-	app.cleanupRunWorktree(context.Background(), cfg, state)
+	var errw bytes.Buffer
+	app := App{Out: &bytes.Buffer{}, Err: &errw, Cwd: root, Interactive: false}
+	cleanup := app.cleanupRunWorktree(context.Background(), cfg, state)
+	if cleanup.Status != "auto_returned" {
+		t.Fatalf("cleanup status = %q", cleanup.Status)
+	}
+	if strings.TrimSpace(errw.String()) != "" {
+		t.Fatalf("expected quiet successful cleanup, got stderr %q", errw.String())
+	}
 	content, err := os.ReadFile(logPath)
 	if err != nil {
 		t.Fatal(err)

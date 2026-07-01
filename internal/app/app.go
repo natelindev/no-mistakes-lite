@@ -412,8 +412,8 @@ func (a App) run(ctx context.Context, args []string) int {
 		toon.Error(a.Out, err.Error(), nil)
 		return ExitError
 	}
-	a.cleanupRunWorktree(ctx, cfg, run)
-	printRunPrepared(a.Out, run, path)
+	cleanup := a.cleanupRunWorktree(ctx, cfg, run)
+	printRunCompleted(a.Out, run, path, cleanup)
 	return ExitOK
 }
 
@@ -1382,22 +1382,29 @@ func (a App) runPushAndPR(ctx context.Context, cfg config.Config, opts runOption
 	return nil
 }
 
-func (a App) cleanupRunWorktree(ctx context.Context, cfg config.Config, run runstate.State) {
-	if !cfg.Cleanup.Auto || strings.TrimSpace(run.WorktreePath) == "" {
-		return
+type cleanupResult struct {
+	Status string
+}
+
+func (a App) cleanupRunWorktree(ctx context.Context, cfg config.Config, run runstate.State) cleanupResult {
+	if strings.TrimSpace(run.WorktreePath) == "" {
+		return cleanupResult{}
+	}
+	if !cfg.Cleanup.Auto {
+		return cleanupResult{Status: "manual"}
 	}
 	treehousePath, ok := treehouse.Detect()
 	if !ok {
 		a.warn("auto-cleanup skipped because treehouse is unavailable")
-		return
+		return cleanupResult{Status: "skipped"}
 	}
 	chdirAwayFrom(run.WorktreePath)
 	client := treehouse.New(treehousePath, "")
 	if err := client.Return(ctx, run.WorktreePath, true); err != nil {
 		a.warn("auto-cleanup failed for %s: %v", run.WorktreePath, err)
-		return
+		return cleanupResult{Status: "failed"}
 	}
-	a.progress("auto-cleaned treehouse worktree %s", run.WorktreePath)
+	return cleanupResult{Status: "auto_returned"}
 }
 
 func chdirAwayFrom(path string) {
@@ -2753,8 +2760,8 @@ func (a App) continueRun(ctx context.Context, options cfgLoadOptions, state runs
 		toon.Error(a.Out, err.Error(), nil)
 		return ExitError
 	}
-	a.cleanupRunWorktree(ctx, cfg, state)
-	printRunPrepared(a.Out, state, path)
+	cleanup := a.cleanupRunWorktree(ctx, cfg, state)
+	printRunCompleted(a.Out, state, path, cleanup)
 	return ExitOK
 }
 
@@ -2917,8 +2924,8 @@ func (a App) applyReviewGateResponse(ctx context.Context, path string, state run
 		toon.Error(a.Out, err.Error(), nil)
 		return ExitError
 	}
-	a.cleanupRunWorktree(ctx, cfg, state)
-	printRunPrepared(a.Out, state, path)
+	cleanup := a.cleanupRunWorktree(ctx, cfg, state)
+	printRunCompleted(a.Out, state, path, cleanup)
 	return ExitOK
 }
 
@@ -3530,24 +3537,53 @@ func printReviewGate(w io.Writer, state runstate.State, path string, findings []
 	toon.List(w, "help", help)
 }
 
-func printRunPrepared(w io.Writer, state runstate.State, path string) {
+func printRunCompleted(w io.Writer, state runstate.State, path string, cleanup cleanupResult) {
 	toon.KV(w, "run", state.ID)
 	toon.KV(w, "status", displayRunStatus(state))
 	toon.KV(w, "state_path", path)
+	if strings.TrimSpace(state.PRURL) != "" {
+		toon.KV(w, "pr_url", state.PRURL)
+	}
 	toon.KV(w, "source_branch", state.SourceBranch)
 	toon.KV(w, "review_branch", state.ReviewBranch)
-	toon.KV(w, "worktree_path", state.WorktreePath)
 	toon.KV(w, "base", state.BaseRef)
+	if strings.TrimSpace(state.WorktreePath) != "" {
+		toon.KV(w, "worktree_path", state.WorktreePath)
+	}
+	if cleanup.Status != "" {
+		toon.KV(w, "cleanup", cleanup.Status)
+	}
 	intent, truncated := previewText(state.Intent, false, detailPreviewLimit)
 	toon.KV(w, "intent", intent)
-	rows, stepTruncated := stepRows(state, false)
-	truncated = truncated || stepTruncated
-	toon.Table(w, "steps", []string{"name", "status", "detail"}, rows)
-	help := []string{"Inspect this run with `nml status --run " + state.ID + "`.", "If cleanup.auto is false, return the lease manually with `treehouse return " + state.WorktreePath + " --force` when you are done."}
+	toon.Table(w, "steps", []string{"name", "status"}, stepStatusRows(state))
+	help := []string{"Run `nml status --run " + state.ID + "` for step details."}
+	help = append(help, cleanupHelp(state, cleanup)...)
 	if truncated {
 		help = append(help, "Run `nml status --run "+state.ID+" --full` to see complete long fields.")
 	}
 	toon.List(w, "help", help)
+}
+
+func cleanupHelp(state runstate.State, cleanup cleanupResult) []string {
+	if strings.TrimSpace(state.WorktreePath) == "" {
+		return nil
+	}
+	switch cleanup.Status {
+	case "manual":
+		return []string{"Return the retained worktree with `treehouse return " + state.WorktreePath + " --force` when done."}
+	case "failed", "skipped":
+		return []string{"Auto-cleanup did not return the worktree; run `treehouse return " + state.WorktreePath + " --force` when done."}
+	default:
+		return nil
+	}
+}
+
+func stepStatusRows(state runstate.State) []toon.Row {
+	rows := make([]toon.Row, 0, len(state.Steps))
+	for _, step := range state.Steps {
+		rows = append(rows, toon.Row{step.Name, string(step.Status)})
+	}
+	return rows
 }
 
 func displayRunStatus(state runstate.State) string {
