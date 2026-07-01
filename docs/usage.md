@@ -35,9 +35,10 @@ preflight -> intent -> commit -> worktree -> review -> test -> docs -> lint -> p
 - Intent is stored before agent fixes mutate the change.
 - A treehouse lease provides the isolated review worktree unless the command is already running inside a Treehouse-managed worktree, in which case nml reuses the current worktree.
 - Review uses exact `LGTM` or Markdown findings. PR bodies include the actual review findings for every non-LGTM round.
+- Set `review.auto_approve_after_rounds=true` to continue after the configured review rounds even when auto-fix attempts still leave findings.
 - Pass `--skip-review` to mark the review step skipped without invoking the configured agent or built-in review checks.
 - Tests, docs, lint, CI, and deploy can ask the configured agent for fixes. PR bodies summarize only each command and final status, not full command output.
-- If GitHub initially reports no PR checks, nml waits briefly for checks to register before deciding there are no checks. Runs that use `--yolo` or explicitly skip review require reported CI checks and fail if none appear.
+- If GitHub initially reports no PR checks, nml waits briefly for checks to register before deciding there are no checks. Runs that use `--yolo`, explicitly skip review, or auto-approve unresolved review findings require reported CI checks and fail if none appear.
 - Completed runs print a compact summary with PR URL, cleanup status, and step statuses. Use `nml status --run <id>` or `nml status --run <id> --full` for step details and logs.
 - Auto-merge means nml runs `gh pr merge` after checks pass. It does not use GitHub's repository-level auto-merge feature. GitHub CLI prompts are disabled, so nml fails with saved state instead of waiting for terminal input.
 - Cleanup auto-return is enabled by default. After a completed run, nml returns the Treehouse worktree with `treehouse return --force`. If the current terminal started inside that worktree, nml keeps it so the parent shell is not left in a removed directory. Set `cleanup.auto=false` to keep completed worktrees for inspection.
@@ -79,13 +80,14 @@ Persist run defaults globally or for the current project. Project settings overr
 ```sh
 nml config --interactive
 nml config --scope project --set review.yolo=true --set ci.timeout=15m
+nml config --scope project --set review.auto_approve_after_rounds=true
 nml config --scope project --set auto_merge.enabled=true --set auto_merge.method=squash
 nml config --scope project --set cleanup.auto=false
 nml config --scope global --set review.yolo=false --set ci.timeout=30m
 nml config --format toon
 ```
 
-`nml config --interactive` starts with a scope picker, then prompts for yolo review fixing, auto-merge, merge method, auto-cleanup, CI timeout, test command, and lint command. Supported non-interactive keys are `review.yolo`, `auto_merge.enabled`, `auto_merge.method`, `cleanup.auto`, `ci.timeout`, `commands.test`, and `commands.lint`. CLI flags still override persisted defaults for that invocation.
+`nml config --interactive` starts with a scope picker, then prompts for yolo review fixing, auto-approve after review rounds, auto-merge, merge method, auto-cleanup, CI timeout, test command, and lint command. Supported non-interactive keys are `review.yolo`, `review.auto_approve_after_rounds`, `auto_merge.enabled`, `auto_merge.method`, `cleanup.auto`, `ci.timeout`, `commands.test`, and `commands.lint`. CLI flags still override persisted defaults for that invocation.
 
 ## Agent integrations
 

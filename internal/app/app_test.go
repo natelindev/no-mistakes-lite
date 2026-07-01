@@ -341,6 +341,59 @@ func TestRunReviewSkipReviewDoesNotRequireAgent(t *testing.T) {
 	t.Fatal("review step missing")
 }
 
+func TestRunReviewAutoApprovesAfterConfiguredRounds(t *testing.T) {
+	repo := newAppTestRepo(t, filepath.Join(t.TempDir(), "repo"))
+	runGitAppTest(t, repo, "checkout", "-b", "feature/auto-approve")
+	if err := os.WriteFile(filepath.Join(repo, "file.txt"), []byte("hello\nchange\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAppTest(t, repo, "add", "file.txt")
+	runGitAppTest(t, repo, "commit", "-m", "feat: change file")
+	sourceHead := strings.TrimSpace(runGitAppTestOutput(t, repo, "rev-parse", "HEAD"))
+
+	fakePi := filepath.Join(t.TempDir(), "pi")
+	if err := os.WriteFile(fakePi, []byte("#!/bin/sh\necho '- [warning] file.txt:1 - unresolved finding'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults()
+	cfg.Agent.Name = "pi"
+	cfg.Agent.PathOverrides["pi"] = fakePi
+	cfg.Review.Rounds = 3
+	cfg.Review.AutoApproveAfterRounds = true
+	state := runstate.New(repo, "feature/auto-approve", "main", "origin", sourceHead, "main")
+	state.WorktreePath = repo
+	state.Intent = "change file"
+
+	var errw bytes.Buffer
+	app := App{Err: &errw, Interactive: false}
+	outcome, err := app.runReview(context.Background(), cfg, runOptions{Yolo: true}, &state)
+	if err != nil {
+		t.Fatalf("runReview returned error: %v\nstderr:\n%s", err, errw.String())
+	}
+	if outcome.AwaitingUser {
+		t.Fatal("auto-approved review should not wait for user input")
+	}
+	var reviewStep runstate.Step
+	for _, step := range state.Steps {
+		if step.Name == "review" {
+			reviewStep = step
+			break
+		}
+	}
+	if reviewStep.Status != runstate.StatusCompleted {
+		t.Fatalf("review status = %s, want completed", reviewStep.Status)
+	}
+	if !strings.Contains(reviewStep.Detail, "auto-approved after configured review rounds") {
+		t.Fatalf("review detail should mention auto approval, got %q", reviewStep.Detail)
+	}
+	if len(reviewStep.Rounds) != 3 {
+		t.Fatalf("review rounds = %d, want 3", len(reviewStep.Rounds))
+	}
+	if reviewStep.Rounds[2].Result != "auto_approved" {
+		t.Fatalf("final round result = %q, want auto_approved", reviewStep.Rounds[2].Result)
+	}
+}
+
 func TestWatchPRChecksWaitsForLateReportedChecks(t *testing.T) {
 	calls := 0
 	var sleeps []time.Duration
@@ -406,6 +459,11 @@ func TestCIRequiresReportedChecksForRiskyReviewModes(t *testing.T) {
 	noAgent.SetStep("review", runstate.StatusSkipped, "no configured agent; run nml init to enable review")
 	if ciRequiresReportedChecks(runOptions{}, noAgent) {
 		t.Fatal("missing review agent should not change no-checks policy")
+	}
+	autoApproved := base
+	autoApproved.SetStep("review", runstate.StatusCompleted, "round 3 found 2 findings; auto-approved after configured review rounds")
+	if !ciRequiresReportedChecks(runOptions{}, autoApproved) {
+		t.Fatal("auto-approved unresolved review findings should require reported checks")
 	}
 }
 

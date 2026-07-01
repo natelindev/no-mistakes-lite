@@ -37,6 +37,7 @@ nml respond --action approve
 nml config --format toon
 nml config --interactive
 nml config --scope project --set review.yolo=true --set ci.timeout=15m
+nml config --scope project --set review.auto_approve_after_rounds=true
 nml config --scope global --set auto_merge.enabled=true
 nml config --scope project --set cleanup.auto=false
 nml hooks install --apps claude,codex,opencode
@@ -59,18 +60,18 @@ The repository also carries an Agent Skill at `skills/no-mistakes-lite/SKILL.md`
 ## Implemented first
 
 - Go module and `nml` binary skeleton.
-- Global and per-repo config loading from `~/.config/nml`, including persistent run defaults such as yolo review fixing, auto-merge, auto-cleanup, CI timeout, and validation commands.
+- Global and per-repo config loading from `~/.config/nml`, including persistent run defaults such as yolo review fixing, auto-approve after review rounds, auto-merge, auto-cleanup, CI timeout, and validation commands.
 - Git preflight classification and no-op exits.
 - Non-interactive first-run setup with `--yes`, plus an explicit `--interactive` wizard for humans.
 - Doctor command with TOON output.
 - Dirty worktree staging, agent-generated commit metadata, and commit hook fix retries.
 - Agent or fallback intent generation and JSON run state under `.git/nml/runs`, mirrored to `~/.nml/runs` with event and log files for resume.
 - Treehouse worktree leasing with completed-run auto-cleanup that preserves a worktree when the current terminal started inside it, current Treehouse worktree reuse, exact source commit reuse, and cherry-pick or format-patch fallback.
-- First review loop using configured agents, exact `LGTM`, Markdown finding parsing, review gate output, `--skip-review`, and `--yes` or `--yolo` automatic fix attempts.
+- First review loop using configured agents, exact `LGTM`, Markdown finding parsing, review gate output, configured auto-approval after review rounds, `--skip-review`, and `--yes` or `--yolo` automatic fix attempts.
 - Test command execution only when configured per repo or supplied per run, plus lint command execution with skip reasons and agent fix retries.
 - Docs evaluation and optional agent documentation updates.
 - GitHub remote detection, safe push of tool-owned `nml/*` branches, and GitHub PR create/update through `gh` when available.
-- Bounded CI watch with delayed check registration handling, failed-log collection, persisted CI logs, stricter no-checks handling for yolo or skipped-review runs, agent CI fix retries, optional per-run auto-merge with GitHub CLI prompts disabled, and optional deploy command retries.
+- Bounded CI watch with delayed check registration handling, failed-log collection, persisted CI logs, stricter no-checks handling for yolo, skipped-review, or unresolved-finding auto-approved runs, agent CI fix retries, optional per-run auto-merge with GitHub CLI prompts disabled, and optional deploy command retries.
 - Resumable failed or interrupted runs via `nml resume`, review finding parser, secret redaction, PR body generation, Bubble Tea run timeline and interactive review gate response picker, AXI session hook installation for Claude Code, Codex, and OpenCode, installable Agent Skill, binary-only install script, usage docs, and unit tests.
 
 See `docs/usage.md` for workflow details. Future work is mostly provider expansion.

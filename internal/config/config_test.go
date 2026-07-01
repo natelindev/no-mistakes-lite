@@ -24,6 +24,9 @@ func TestDefaults(t *testing.T) {
 	if cfg.Review.Yolo {
 		t.Fatal("review.yolo should default false")
 	}
+	if cfg.Review.AutoApproveAfterRounds {
+		t.Fatal("review.auto_approve_after_rounds should default false")
+	}
 	if cfg.AutoMerge.Enabled {
 		t.Fatal("auto_merge.enabled should default false")
 	}
@@ -106,11 +109,14 @@ func TestApplyCanOverridePersistentRunSettings(t *testing.T) {
 	trueValue := true
 	method := "rebase"
 	Apply(&cfg, RawConfig{
-		Review:    &RawReviewConfig{Yolo: &trueValue},
+		Review:    &RawReviewConfig{Yolo: &trueValue, AutoApproveAfterRounds: &trueValue},
 		AutoMerge: &RawAutoMergeConfig{Enabled: &trueValue, Method: &method},
 	})
 	if !cfg.Review.Yolo {
 		t.Fatal("expected review.yolo true override")
+	}
+	if !cfg.Review.AutoApproveAfterRounds {
+		t.Fatal("expected review.auto_approve_after_rounds true override")
 	}
 	if !cfg.AutoMerge.Enabled {
 		t.Fatal("expected auto_merge.enabled true override")
@@ -150,10 +156,11 @@ func TestSaveScopedSettingsSupportsGlobalAndProject(t *testing.T) {
 	repoA := newConfigTestRepo(t, "a")
 	repoB := newConfigTestRepo(t, "b")
 	if _, err := SaveScopedSettings("", "global", map[string]string{
-		"review.yolo":        "true",
-		"auto_merge.enabled": "true",
-		"cleanup.auto":       "false",
-		"ci.timeout":         "15m",
+		"review.yolo":                      "true",
+		"review.auto_approve_after_rounds": "true",
+		"auto_merge.enabled":               "true",
+		"cleanup.auto":                     "false",
+		"ci.timeout":                       "15m",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +175,7 @@ func TestSaveScopedSettingsSupportsGlobalAndProject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfgA.Review.Yolo || cfgA.CI.Timeout != "15m" {
+	if !cfgA.Review.Yolo || !cfgA.Review.AutoApproveAfterRounds || cfgA.CI.Timeout != "15m" {
 		t.Fatalf("repo A did not inherit global settings: %#v", cfgA)
 	}
 	if cfgA.AutoMerge.Enabled {

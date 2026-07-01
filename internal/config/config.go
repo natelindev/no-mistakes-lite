@@ -38,9 +38,10 @@ type CommitConfig struct {
 }
 
 type ReviewConfig struct {
-	Rounds         int      `yaml:"rounds" json:"rounds"`
-	Yolo           bool     `yaml:"yolo" json:"yolo"`
-	IgnorePatterns []string `yaml:"ignore_patterns" json:"ignore_patterns"`
+	Rounds                 int      `yaml:"rounds" json:"rounds"`
+	Yolo                   bool     `yaml:"yolo" json:"yolo"`
+	AutoApproveAfterRounds bool     `yaml:"auto_approve_after_rounds" json:"auto_approve_after_rounds"`
+	IgnorePatterns         []string `yaml:"ignore_patterns" json:"ignore_patterns"`
 }
 
 type CIConfig struct {
@@ -157,9 +158,10 @@ type RawCommitConfig struct {
 }
 
 type RawReviewConfig struct {
-	Rounds         *int     `yaml:"rounds"`
-	Yolo           *bool    `yaml:"yolo"`
-	IgnorePatterns []string `yaml:"ignore_patterns"`
+	Rounds                 *int     `yaml:"rounds"`
+	Yolo                   *bool    `yaml:"yolo"`
+	AutoApproveAfterRounds *bool    `yaml:"auto_approve_after_rounds"`
+	IgnorePatterns         []string `yaml:"ignore_patterns"`
 }
 
 type RawCIConfig struct {
@@ -340,6 +342,9 @@ func Apply(cfg *Config, raw RawConfig) {
 		if raw.Review.Yolo != nil {
 			cfg.Review.Yolo = *raw.Review.Yolo
 		}
+		if raw.Review.AutoApproveAfterRounds != nil {
+			cfg.Review.AutoApproveAfterRounds = *raw.Review.AutoApproveAfterRounds
+		}
 		if raw.Review.IgnorePatterns != nil {
 			cfg.Review.IgnorePatterns = append([]string(nil), raw.Review.IgnorePatterns...)
 		}
@@ -454,6 +459,12 @@ func parseSetting(key, value string) (any, string, error) {
 			return nil, "", fmt.Errorf("%s must be true or false", key)
 		}
 		return parsed, "review.yolo", nil
+	case "review.auto_approve_after_rounds", "auto_approve_after_rounds":
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return nil, "", fmt.Errorf("%s must be true or false", key)
+		}
+		return parsed, "review.auto_approve_after_rounds", nil
 	case "auto_merge", "auto_merge.enabled":
 		parsed, err := strconv.ParseBool(value)
 		if err != nil {

@@ -835,18 +835,26 @@ func (a App) runReview(ctx context.Context, cfg config.Config, opts runOptions, 
 			run.SetStep("review", runstate.StatusCompleted, fmt.Sprintf("round %d LGTM", round))
 			return reviewOutcome{}, nil
 		}
-		appendReviewRound(run, runstate.ReviewRound{Number: round, Result: "findings", Findings: parsed.Findings})
 		if len(parsed.Findings) == 0 {
+			appendReviewRound(run, runstate.ReviewRound{Number: round, Result: "findings"})
 			run.SetStep("review", runstate.StatusCompleted, fmt.Sprintf("round %d had no actionable findings", round))
 			return reviewOutcome{}, nil
 		}
 		if !opts.Yes && !opts.Yolo {
+			appendReviewRound(run, runstate.ReviewRound{Number: round, Result: "findings", Findings: parsed.Findings})
 			run.SetStep("review", runstate.StatusAwaitingUser, fmt.Sprintf("round %d found %d findings", round, len(parsed.Findings)))
 			return reviewOutcome{AwaitingUser: true, Findings: parsed.Findings}, nil
 		}
 		if round == rounds {
+			if cfg.Review.AutoApproveAfterRounds {
+				appendReviewRound(run, runstate.ReviewRound{Number: round, Result: "auto_approved", Findings: parsed.Findings})
+				run.SetStep("review", runstate.StatusCompleted, fmt.Sprintf("round %d found %d findings; auto-approved after configured review rounds", round, len(parsed.Findings)))
+				return reviewOutcome{}, nil
+			}
+			appendReviewRound(run, runstate.ReviewRound{Number: round, Result: "findings", Findings: parsed.Findings})
 			return reviewOutcome{}, fmt.Errorf("review still found %d findings after %d rounds", len(parsed.Findings), rounds)
 		}
+		appendReviewRound(run, runstate.ReviewRound{Number: round, Result: "findings", Findings: parsed.Findings})
 		run.SetStep("review", runstate.StatusFixing, fmt.Sprintf("round %d fixing %d findings", round, len(parsed.Findings)))
 		if err := a.withSpinner(ctx, "fixing review findings", func() error { return fixReviewFindings(ctx, runner, cfg, run, parsed.Findings) }); err != nil {
 			return reviewOutcome{}, err
@@ -1502,7 +1510,7 @@ func (a App) runCIWatch(ctx context.Context, cfg config.Config, opts runOptions,
 				detail = "no checks reported"
 			}
 			if status == "no_checks" && ciRequiresReportedChecks(opts, *run) {
-				detail += "; reported CI checks are required when review is skipped or yolo mode is enabled"
+				detail += "; reported CI checks are required when review is skipped, yolo mode is enabled, or unresolved findings were auto-approved"
 				run.SetStep("ci", runstate.StatusFailed, detail)
 				return fmt.Errorf("%s", detail)
 			}
@@ -1645,11 +1653,16 @@ func ciRequiresReportedChecks(opts runOptions, run runstate.State) bool {
 		return true
 	}
 	for _, step := range run.Steps {
-		if step.Name != "review" || step.Status != runstate.StatusSkipped {
+		if step.Name != "review" {
 			continue
 		}
 		detail := strings.ToLower(step.Detail)
-		return strings.Contains(detail, "--skip-review") || strings.Contains(detail, "skipped by user")
+		if step.Status == runstate.StatusSkipped {
+			return strings.Contains(detail, "--skip-review") || strings.Contains(detail, "skipped by user")
+		}
+		if step.Status == runstate.StatusCompleted && strings.Contains(detail, "auto-approved") {
+			return true
+		}
 	}
 	return false
 }
@@ -2286,6 +2299,7 @@ func (a App) init(ctx context.Context, args []string) int {
 		{"test", testCmd},
 		{"lint", cfg.Commands.Lint},
 		{"review.yolo", fmt.Sprint(cfg.Review.Yolo)},
+		{"review.auto_approve_after_rounds", fmt.Sprint(cfg.Review.AutoApproveAfterRounds)},
 		{"ci.timeout", cfg.CI.Timeout},
 		{"auto_merge.enabled", fmt.Sprint(cfg.AutoMerge.Enabled)},
 		{"auto_merge.method", cfg.AutoMerge.Method},
@@ -2470,6 +2484,7 @@ func (a App) config(ctx context.Context, args []string) int {
 			{"lint", cfg.Commands.Lint},
 			{"review.rounds", fmt.Sprint(cfg.Review.Rounds)},
 			{"review.yolo", fmt.Sprint(cfg.Review.Yolo)},
+			{"review.auto_approve_after_rounds", fmt.Sprint(cfg.Review.AutoApproveAfterRounds)},
 			{"ci.timeout", cfg.CI.Timeout},
 			{"auto_merge.enabled", fmt.Sprint(cfg.AutoMerge.Enabled)},
 			{"auto_merge.method", cfg.AutoMerge.Method},
@@ -2504,6 +2519,10 @@ func (a App) configInteractive(ctx context.Context, repoRoot string) int {
 	if cancelled {
 		return a.setupCancelled()
 	}
+	autoApproveAfterRounds, cancelled := a.promptChoice(ctx, "Auto-approve after review rounds", fmt.Sprint(cfg.Review.AutoApproveAfterRounds), []string{"false", "true"})
+	if cancelled {
+		return a.setupCancelled()
+	}
 	autoMerge, cancelled := a.promptChoice(ctx, "Enable auto-merge", fmt.Sprint(cfg.AutoMerge.Enabled), []string{"false", "true"})
 	if cancelled {
 		return a.setupCancelled()
@@ -2529,13 +2548,14 @@ func (a App) configInteractive(ctx context.Context, repoRoot string) int {
 		return a.setupCancelled()
 	}
 	settings := map[string]string{
-		"review.yolo":        yolo,
-		"auto_merge.enabled": autoMerge,
-		"auto_merge.method":  mergeMethod,
-		"cleanup.auto":       cleanupAuto,
-		"ci.timeout":         ciTimeout,
-		"commands.test":      testCommand,
-		"commands.lint":      lintCommand,
+		"review.yolo":                      yolo,
+		"review.auto_approve_after_rounds": autoApproveAfterRounds,
+		"auto_merge.enabled":               autoMerge,
+		"auto_merge.method":                mergeMethod,
+		"cleanup.auto":                     cleanupAuto,
+		"ci.timeout":                       ciTimeout,
+		"commands.test":                    testCommand,
+		"commands.lint":                    lintCommand,
 	}
 	path, err := config.SaveScopedSettings(repoRoot, scope, settings)
 	if err != nil {
@@ -2547,6 +2567,7 @@ func (a App) configInteractive(ctx context.Context, repoRoot string) int {
 	toon.KV(a.Out, "path", path)
 	toon.Table(a.Out, "settings", []string{"key", "value"}, []toon.Row{
 		{"review.yolo", yolo},
+		{"review.auto_approve_after_rounds", autoApproveAfterRounds},
 		{"auto_merge.enabled", autoMerge},
 		{"auto_merge.method", mergeMethod},
 		{"cleanup.auto", cleanupAuto},
@@ -4187,6 +4208,7 @@ func printConfigHelp(w io.Writer) {
 	fmt.Fprintln(w, "  --set-test-command <cmd>   save a per-repo test command (default: none)")
 	fmt.Fprintln(w, "Settings:")
 	fmt.Fprintln(w, "  review.yolo=true|false")
+	fmt.Fprintln(w, "  review.auto_approve_after_rounds=true|false")
 	fmt.Fprintln(w, "  auto_merge.enabled=true|false")
 	fmt.Fprintln(w, "  auto_merge.method=squash|merge|rebase")
 	fmt.Fprintln(w, "  cleanup.auto=true|false")
@@ -4197,6 +4219,7 @@ func printConfigHelp(w io.Writer) {
 	fmt.Fprintln(w, "  nml config --format toon")
 	fmt.Fprintln(w, "  nml config --interactive")
 	fmt.Fprintln(w, "  nml config --scope project --set review.yolo=true --set ci.timeout=15m")
+	fmt.Fprintln(w, "  nml config --scope project --set review.auto_approve_after_rounds=true")
 	fmt.Fprintln(w, "  nml config --scope global --set auto_merge.enabled=true")
 	fmt.Fprintln(w, "  nml config --scope project --set cleanup.auto=false")
 	fmt.Fprintln(w, "  nml config --set-test-command \"go test ./...\"")
