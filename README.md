@@ -1,6 +1,20 @@
 # no-mistakes Lite (`nml`)
 
-`nml` is a lightweight local workflow driver inspired by no-mistakes. It inspects a git repository, records original user intent, prepares committed changes for isolated validation, and is being built toward review, test, lint, PR, CI, optional automerge, and deploy steps.
+`nml` is a lightweight local workflow driver inspired by [no-mistakes](https://github.com/kunchenguid/no-mistakes). It inspects a git repository, records original user intent, prepares committed changes for isolated validation, and is being built toward review, test, lint, PR, CI, optional automerge, and deploy steps.
+
+## Inspiration and key differences
+
+[`no-mistakes`](https://github.com/kunchenguid/no-mistakes) gates changes by putting a local git proxy in front of your real remote: push to the gate, let the AI validation pipeline run in a disposable worktree, then forward only clean work to the configured push target and PR flow.
+
+`nml` explores a smaller command-first take on the same idea:
+
+- **No git proxy remote required** - run `nml run`, `nml status`, `nml respond`, and `nml resume` directly from the repository.
+- **Agent-friendly by default** - headless commands emit compact TOON on stdout, progress on stderr, and avoid prompts unless an explicit interactive command is used.
+- **Lightweight local state** - run state lives under `.git/nml/runs` and is mirrored to `~/.nml/runs` for resume and logs.
+- **Explicit worktree isolation** - Treehouse leases provide isolated validation worktrees, with current worktree reuse when already inside a Treehouse-managed checkout.
+- **Incremental scope** - `nml` focuses on a small binary, simple config, direct GitHub PR/CI automation, and hooks or skills that can be installed separately.
+
+Use `no-mistakes` when you want the full git-push gate workflow. Use `nml` when you want a minimal CLI that agents and scripts can call directly.
 
 ## Current commands
 
