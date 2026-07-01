@@ -1496,8 +1496,17 @@ func (a App) runCIWatch(ctx context.Context, cfg config.Config, opts runOptions,
 			run.SetStep("ci", runstate.StatusCompleted, commandDetail("gh pr checks", out))
 			return nil
 		}
-		if status == "skipped" {
-			run.SetStep("ci", runstate.StatusSkipped, strings.TrimSpace(out))
+		if status == "skipped" || status == "no_checks" {
+			detail := strings.TrimSpace(out)
+			if detail == "" {
+				detail = "no checks reported"
+			}
+			if status == "no_checks" && ciRequiresReportedChecks(opts, *run) {
+				detail += "; reported CI checks are required when review is skipped or yolo mode is enabled"
+				run.SetStep("ci", runstate.StatusFailed, detail)
+				return fmt.Errorf("%s", detail)
+			}
+			run.SetStep("ci", runstate.StatusSkipped, detail)
 			return nil
 		}
 		if status == "timeout" {
@@ -1547,25 +1556,102 @@ func (a App) runCIWatch(ctx context.Context, cfg config.Config, opts runOptions,
 	return fmt.Errorf("CI did not complete")
 }
 
+type ghRunFunc func(context.Context, string, string, ...string) (string, error)
+
+type contextSleepFunc func(context.Context, time.Duration) bool
+
 func watchPRChecks(ctx context.Context, ghPath, cwd, prURL string, timeout, interval time.Duration) (string, string, error) {
+	return watchPRChecksWithRunner(ctx, ghPath, cwd, prURL, timeout, interval, noChecksGrace(timeout, interval), runGH, sleepContext)
+}
+
+func watchPRChecksWithRunner(ctx context.Context, ghPath, cwd, prURL string, timeout, interval, noChecksWait time.Duration, run ghRunFunc, sleep contextSleepFunc) (string, string, error) {
 	watchCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	seconds := int(interval.Seconds())
 	if seconds < 1 {
 		seconds = 20
+		interval = 20 * time.Second
 	}
-	out, err := runGH(watchCtx, ghPath, cwd, "pr", "checks", prURL, "--watch", "--interval", fmt.Sprint(seconds))
-	if watchCtx.Err() != nil {
-		return out, "timeout", watchCtx.Err()
+	if noChecksWait < 0 {
+		noChecksWait = 0
 	}
+	var lastNoChecks string
+	waitedForChecks := time.Duration(0)
+	for {
+		out, err := run(watchCtx, ghPath, cwd, "pr", "checks", prURL, "--watch", "--interval", fmt.Sprint(seconds))
+		if watchCtx.Err() != nil {
+			if strings.TrimSpace(out) == "" {
+				out = lastNoChecks
+			}
+			return out, "timeout", watchCtx.Err()
+		}
+		if err == nil {
+			return out, "passed", nil
+		}
+		if isNoChecksOutput(out) {
+			lastNoChecks = out
+			if noChecksWait == 0 || waitedForChecks >= noChecksWait {
+				return out, "no_checks", nil
+			}
+			sleepFor := interval
+			if remaining := noChecksWait - waitedForChecks; remaining < sleepFor {
+				sleepFor = remaining
+			}
+			if !sleep(watchCtx, sleepFor) {
+				return lastNoChecks, "timeout", watchCtx.Err()
+			}
+			waitedForChecks += sleepFor
+			continue
+		}
+		return out, "failed", err
+	}
+}
+
+func sleepContext(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func noChecksGrace(timeout, interval time.Duration) time.Duration {
+	if timeout <= 0 {
+		return 0
+	}
+	grace := 2 * time.Minute
+	if minimum := interval * 3; minimum > grace {
+		grace = minimum
+	}
+	if timeout < grace {
+		return timeout
+	}
+	return grace
+}
+
+func isNoChecksOutput(out string) bool {
 	lower := strings.ToLower(out)
-	if err == nil {
-		return out, "passed", nil
+	return strings.Contains(lower, "no checks") || strings.Contains(lower, "no check") || strings.Contains(lower, "no ci")
+}
+
+func ciRequiresReportedChecks(opts runOptions, run runstate.State) bool {
+	if opts.Yolo || opts.SkipReview {
+		return true
 	}
-	if strings.Contains(lower, "no checks") || strings.Contains(lower, "no check") || strings.Contains(lower, "no ci") {
-		return out, "skipped", nil
+	for _, step := range run.Steps {
+		if step.Name != "review" || step.Status != runstate.StatusSkipped {
+			continue
+		}
+		detail := strings.ToLower(step.Detail)
+		return strings.Contains(detail, "--skip-review") || strings.Contains(detail, "skipped by user")
 	}
-	return out, "failed", err
+	return false
 }
 
 func collectCILogs(ctx context.Context, ghPath, cwd, branch string) string {

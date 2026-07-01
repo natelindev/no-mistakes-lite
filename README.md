@@ -70,7 +70,7 @@ The repository also carries an Agent Skill at `skills/no-mistakes-lite/SKILL.md`
 - Test command execution only when configured per repo or supplied per run, plus lint command execution with skip reasons and agent fix retries.
 - Docs evaluation and optional agent documentation updates.
 - GitHub remote detection, safe push of tool-owned `nml/*` branches, and GitHub PR create/update through `gh` when available.
-- Bounded CI watch, failed-log collection, persisted CI logs, agent CI fix retries, optional per-run auto-merge with GitHub CLI prompts disabled, and optional deploy command retries.
+- Bounded CI watch with delayed check registration handling, failed-log collection, persisted CI logs, stricter no-checks handling for yolo or skipped-review runs, agent CI fix retries, optional per-run auto-merge with GitHub CLI prompts disabled, and optional deploy command retries.
 - Resumable failed or interrupted runs via `nml resume`, review finding parser, secret redaction, PR body generation, Bubble Tea run timeline and interactive review gate response picker, AXI session hook installation for Claude Code, Codex, and OpenCode, installable Agent Skill, binary-only install script, usage docs, and unit tests.
 
 See `docs/usage.md` for workflow details. Future work is mostly provider expansion.

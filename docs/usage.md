@@ -37,6 +37,7 @@ preflight -> intent -> commit -> worktree -> review -> test -> docs -> lint -> p
 - Review uses exact `LGTM` or Markdown findings. PR bodies include the actual review findings for every non-LGTM round.
 - Pass `--skip-review` to mark the review step skipped without invoking the configured agent or built-in review checks.
 - Tests, docs, lint, CI, and deploy can ask the configured agent for fixes. PR bodies summarize only each command and final status, not full command output.
+- If GitHub initially reports no PR checks, nml waits briefly for checks to register before deciding there are no checks. Runs that use `--yolo` or explicitly skip review require reported CI checks and fail if none appear.
 - Completed runs print a compact summary with PR URL, cleanup status, and step statuses. Use `nml status --run <id>` or `nml status --run <id> --full` for step details and logs.
 - Auto-merge means nml runs `gh pr merge` after checks pass. It does not use GitHub's repository-level auto-merge feature. GitHub CLI prompts are disabled, so nml fails with saved state instead of waiting for terminal input.
 - Cleanup auto-return is enabled by default. After a completed run, nml returns the Treehouse worktree with `treehouse return --force`. If the current terminal started inside that worktree, nml keeps it so the parent shell is not left in a removed directory. Set `cleanup.auto=false` to keep completed worktrees for inspection.

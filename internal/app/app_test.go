@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/natelindev/no-mistakes-lite/internal/config"
 	"github.com/natelindev/no-mistakes-lite/internal/review"
@@ -337,6 +339,74 @@ func TestRunReviewSkipReviewDoesNotRequireAgent(t *testing.T) {
 		}
 	}
 	t.Fatal("review step missing")
+}
+
+func TestWatchPRChecksWaitsForLateReportedChecks(t *testing.T) {
+	calls := 0
+	var sleeps []time.Duration
+	runner := func(ctx context.Context, ghPath, cwd string, args ...string) (string, error) {
+		calls++
+		if calls == 1 {
+			return "no checks reported on the branch", errors.New("exit status 1")
+		}
+		return "All checks were successful", nil
+	}
+	sleeper := func(ctx context.Context, d time.Duration) bool {
+		sleeps = append(sleeps, d)
+		return true
+	}
+	out, status, err := watchPRChecksWithRunner(context.Background(), "gh", "/repo", "https://example.test/pr/1", 5*time.Minute, 20*time.Second, 2*time.Minute, runner, sleeper)
+	if err != nil {
+		t.Fatalf("watchPRChecksWithRunner returned error: %v", err)
+	}
+	if status != "passed" {
+		t.Fatalf("status = %s, want passed; output: %s", status, out)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
+	}
+	if len(sleeps) != 1 || sleeps[0] != 20*time.Second {
+		t.Fatalf("unexpected sleeps: %v", sleeps)
+	}
+}
+
+func TestWatchPRChecksNoChecksAfterGrace(t *testing.T) {
+	calls := 0
+	runner := func(ctx context.Context, ghPath, cwd string, args ...string) (string, error) {
+		calls++
+		return "no checks reported on the branch", errors.New("exit status 1")
+	}
+	sleeper := func(ctx context.Context, d time.Duration) bool { return true }
+	out, status, err := watchPRChecksWithRunner(context.Background(), "gh", "/repo", "https://example.test/pr/1", 5*time.Minute, 20*time.Second, 40*time.Second, runner, sleeper)
+	if err != nil {
+		t.Fatalf("watchPRChecksWithRunner returned error: %v", err)
+	}
+	if status != "no_checks" {
+		t.Fatalf("status = %s, want no_checks; output: %s", status, out)
+	}
+	if calls != 3 {
+		t.Fatalf("calls = %d, want 3", calls)
+	}
+}
+
+func TestCIRequiresReportedChecksForRiskyReviewModes(t *testing.T) {
+	base := runstate.New("/repo", "feature", "main", "origin", "abc", "origin/main")
+	if !ciRequiresReportedChecks(runOptions{Yolo: true}, base) {
+		t.Fatal("yolo mode should require reported checks")
+	}
+	if !ciRequiresReportedChecks(runOptions{SkipReview: true}, base) {
+		t.Fatal("skip review option should require reported checks")
+	}
+	skipped := base
+	skipped.SetStep("review", runstate.StatusSkipped, "skipped by user")
+	if !ciRequiresReportedChecks(runOptions{}, skipped) {
+		t.Fatal("user-skipped review should require reported checks")
+	}
+	noAgent := base
+	noAgent.SetStep("review", runstate.StatusSkipped, "no configured agent; run nml init to enable review")
+	if ciRequiresReportedChecks(runOptions{}, noAgent) {
+		t.Fatal("missing review agent should not change no-checks policy")
+	}
 }
 
 func TestBuiltInReviewFindingsCatchesIntentionalBug(t *testing.T) {
