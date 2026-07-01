@@ -45,7 +45,7 @@ Common run flags:
 - `--yes` accepts safe defaults without prompts.
 - `--yolo` auto-selects all actionable findings. Use only with explicit user consent.
 - `--skip-review` skips the entire review phase, including configured agent review and built-in review checks.
-- `--auto-merge` makes nml run `gh pr merge` after checks pass. It does not use GitHub's repository-level auto-merge feature. Use only with explicit user consent.
+- `--auto-merge` makes nml run `gh pr merge` after checks pass. It does not use GitHub's repository-level auto-merge feature. GitHub CLI prompts are disabled, so failures are reported instead of waiting for terminal input. Use only with explicit user consent.
 - `--skip-docs`, `--skip-deploy`, `--ci-timeout <duration>`, `--merge-method <squash|merge|rebase>`, and `--fetch <bool>` tune the run.
 - Persist defaults with `nml config --interactive`, `nml config --scope project --set review.yolo=true --set ci.timeout=15m`, or `nml config --scope global --set auto_merge.enabled=true`. Project settings override global settings.
 

@@ -1399,6 +1399,10 @@ func (a App) cleanupRunWorktree(ctx context.Context, cfg config.Config, run runs
 	if !cfg.Cleanup.Auto {
 		return cleanupResult{Status: "manual"}
 	}
+	if a.startedInsideWorktree(run.WorktreePath) {
+		a.warn("auto-cleanup skipped because the current terminal started inside %s", run.WorktreePath)
+		return cleanupResult{Status: "current_terminal"}
+	}
 	treehousePath, ok := treehouse.Detect()
 	if !ok {
 		a.warn("auto-cleanup skipped because treehouse is unavailable")
@@ -1411,6 +1415,17 @@ func (a App) cleanupRunWorktree(ctx context.Context, cfg config.Config, run runs
 		return cleanupResult{Status: "failed"}
 	}
 	return cleanupResult{Status: "auto_returned"}
+}
+
+func (a App) startedInsideWorktree(worktreePath string) bool {
+	cwd := strings.TrimSpace(a.Cwd)
+	if cwd == "" {
+		current, err := os.Getwd()
+		if err == nil {
+			cwd = current
+		}
+	}
+	return pathWithin(cwd, worktreePath)
 }
 
 func chdirAwayFrom(path string) {
@@ -1987,12 +2002,23 @@ func createOrUpdatePR(ctx context.Context, ghPath, cwd, base, branch, title, bod
 func runGH(ctx context.Context, ghPath, cwd string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, ghPath, args...)
 	cmd.Dir = cwd
+	configureNonInteractiveGH(cmd)
 	out, err := cmd.CombinedOutput()
 	text := redact.Secrets(string(out))
 	if err != nil {
 		return text, fmt.Errorf("gh %s failed: %w: %s", strings.Join(args, " "), err, text)
 	}
 	return text, nil
+}
+
+func configureNonInteractiveGH(cmd *exec.Cmd) {
+	cmd.Stdin = strings.NewReader("")
+	cmd.Env = append(os.Environ(),
+		"GH_PROMPT_DISABLED=1",
+		"GIT_TERMINAL_PROMPT=0",
+		"GH_NO_UPDATE_NOTIFIER=1",
+		"GH_NO_EXTENSION_UPDATE_NOTIFIER=1",
+	)
 }
 
 func mutatingAgentSystemPrompt() string {
@@ -3578,6 +3604,8 @@ func cleanupHelp(state runstate.State, cleanup cleanupResult) []string {
 	switch cleanup.Status {
 	case "manual":
 		return []string{"Return the retained worktree with `treehouse return " + state.WorktreePath + " --force` when done."}
+	case "current_terminal":
+		return []string{"Auto-cleanup kept the worktree because the current terminal started inside it. From a shell outside the worktree, run `treehouse return " + state.WorktreePath + " --force` when done."}
 	case "failed", "skipped":
 		return []string{"Auto-cleanup did not return the worktree; run `treehouse return " + state.WorktreePath + " --force` when done."}
 	default:
@@ -3919,6 +3947,7 @@ func ghAuthStatus(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "gh", "auth", "status")
+	configureNonInteractiveGH(cmd)
 	return cmd.Run()
 }
 

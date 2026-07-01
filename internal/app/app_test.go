@@ -407,6 +407,37 @@ esac
 	}
 }
 
+func TestRunGHDisablesPrompts(t *testing.T) {
+	dir := t.TempDir()
+	fakeGH := filepath.Join(dir, "gh")
+	script := `#!/bin/sh
+set -eu
+if [ "${GH_PROMPT_DISABLED:-}" != "1" ]; then
+  echo "GH_PROMPT_DISABLED not set" >&2
+  exit 2
+fi
+if [ "${GIT_TERMINAL_PROMPT:-}" != "0" ]; then
+  echo "GIT_TERMINAL_PROMPT not set" >&2
+  exit 2
+fi
+if read line; then
+  echo "stdin should be empty" >&2
+  exit 2
+fi
+echo ok
+`
+	if err := os.WriteFile(fakeGH, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runGH(context.Background(), fakeGH, dir, "pr", "view")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(out) != "ok" {
+		t.Fatalf("unexpected gh output: %q", out)
+	}
+}
+
 func TestRunPreparesTreehouseWorktreeForCleanFeatureBranch(t *testing.T) {
 	root := t.TempDir()
 	home := filepath.Join(root, "home")
@@ -600,6 +631,27 @@ esac
 	}
 	if strings.TrimSpace(string(content)) != worktree+" --force" {
 		t.Fatalf("unexpected return command: %q", content)
+	}
+}
+
+func TestCleanupRunWorktreeSkipsCurrentTerminalWorktree(t *testing.T) {
+	root := t.TempDir()
+	worktree := filepath.Join(root, "worktree")
+	nested := filepath.Join(worktree, "nested")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults()
+	state := runstate.New(root, "feature/test", "main", "origin", "abc", "origin/main")
+	state.WorktreePath = worktree
+	var errw bytes.Buffer
+	app := App{Out: &bytes.Buffer{}, Err: &errw, Cwd: nested, Interactive: false}
+	cleanup := app.cleanupRunWorktree(context.Background(), cfg, state)
+	if cleanup.Status != "current_terminal" {
+		t.Fatalf("cleanup status = %q", cleanup.Status)
+	}
+	if !strings.Contains(errw.String(), "current terminal") || !strings.Contains(errw.String(), worktree) {
+		t.Fatalf("expected current terminal cleanup warning, got %q", errw.String())
 	}
 }
 
