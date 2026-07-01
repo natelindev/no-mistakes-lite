@@ -8,6 +8,7 @@ nml init --yes --agent <name>
 nml doctor
 nml run --message "fix: handle empty input"
 nml run --test-command "go test ./..."
+nml run --skip-review --test-command "go test ./..."
 ```
 
 First-run setup is non-interactive by default for agents. Use `nml init --yes --agent <name>` in automation. Humans can run `nml init --interactive` for the guided prompt-style wizard with keyboard and mouse selection.
@@ -34,6 +35,7 @@ preflight -> intent -> commit -> worktree -> review -> test -> docs -> lint -> p
 - Intent is stored before agent fixes mutate the change.
 - A treehouse lease provides the isolated review worktree unless the command is already running inside a Treehouse-managed worktree, in which case nml reuses the current worktree.
 - Review uses exact `LGTM` or Markdown findings. PR bodies include the actual review findings for every non-LGTM round.
+- Pass `--skip-review` to mark the review step skipped without invoking the configured agent or built-in review checks.
 - Tests, docs, lint, CI, and deploy can ask the configured agent for fixes. PR bodies summarize only each command and final status, not full command output.
 - Completed runs print a compact summary with PR URL, cleanup status, and step statuses. Use `nml status --run <id>` or `nml status --run <id> --full` for step details and logs.
 - Auto-merge means nml runs `gh pr merge` after checks pass. It does not use GitHub's repository-level auto-merge feature.
@@ -51,7 +53,7 @@ nml resume
 nml resume --run <id>
 ```
 
-`nml resume` continues the latest failed or interrupted run. It reuses the leased worktree, reuses or updates the existing PR, pushes local CI-fix commits that are ahead of the remote review branch, and then resumes the remaining validation steps. If the run is stopped at a review gate, resume prints the gate instead of making an approval decision.
+`nml resume` continues the latest failed or interrupted run. It reuses the leased worktree, reuses or updates the existing PR, pushes local CI-fix commits that are ahead of the remote review branch, and then resumes the remaining validation steps. If the run is stopped at a review gate, resume prints the gate instead of making an approval decision. Use `nml resume --skip-review --run <id>` to bypass a pending or failed review phase and continue with validation.
 
 ## Review gates
 
@@ -100,4 +102,4 @@ nml tui
 nml tui --run <id>
 ```
 
-The explicit TUI command shows the saved run timeline with the same `◆`, `◇`, `│`, `◻`, and `└` prompt style. If the saved run is waiting at a review gate, it opens an interactive response picker instead. Long-running operations show progress on stderr with the current step, such as `review round 1`, `running test`, `pushing review branch`, or `watching CI`. Running and fixing steps animate with spinner frames. Press `q`, `esc`, `ctrl+c`, or `ctrl+d` to quit where shown.
+The explicit TUI command shows the saved run timeline with the same `◆`, `◇`, `│`, `◻`, and `└` prompt style. If the saved run is waiting at a review gate, it opens an interactive response picker instead. Long-running operations show progress on stderr with the current step, such as `review round 1`, `running test`, `pushing review branch`, or `watching CI`. Running and fixing steps use a compact Braille spinner. Press `q`, `esc`, `ctrl+c`, or `ctrl+d` to quit where shown.

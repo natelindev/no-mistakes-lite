@@ -192,11 +192,11 @@ func TestInteractiveProgressUsesLeftAlignedTUIStep(t *testing.T) {
 	app := App{Err: &errw, Interactive: true}
 	app.progress("checking documentation")
 	got := appStripANSI(errw.String())
-	want := "◶  checking documentation\n│\n"
+	want := "⠋  checking documentation\n│\n"
 	if got != want {
 		t.Fatalf("progress output = %q, want %q", got, want)
 	}
-	if strings.Contains(got, "│  ◶") {
+	if strings.Contains(got, "│  ⠋") {
 		t.Fatalf("progress marker should be left aligned, got %q", got)
 	}
 }
@@ -295,6 +295,34 @@ func appTestStepStatus(state runstate.State, name string) runstate.StepStatus {
 		}
 	}
 	return ""
+}
+
+func TestRunReviewSkipReviewDoesNotRequireAgent(t *testing.T) {
+	state := runstate.New(t.TempDir(), "feature/test", "main", "origin", "abc", "origin/main")
+	state.WorktreePath = t.TempDir()
+	cfg := config.Defaults()
+	cfg.Agent.Name = "definitely-missing-nml-agent"
+	var errw bytes.Buffer
+	app := App{Err: &errw, Interactive: false}
+	outcome, err := app.runReview(context.Background(), cfg, runOptions{SkipReview: true}, &state)
+	if err != nil {
+		t.Fatalf("runReview returned error: %v", err)
+	}
+	if outcome.AwaitingUser {
+		t.Fatal("skip review should not wait for user input")
+	}
+	for _, step := range state.Steps {
+		if step.Name == "review" {
+			if step.Status != runstate.StatusSkipped {
+				t.Fatalf("review status = %s, want skipped", step.Status)
+			}
+			if step.Detail != "skipped by --skip-review" {
+				t.Fatalf("review detail = %q", step.Detail)
+			}
+			return
+		}
+	}
+	t.Fatal("review step missing")
 }
 
 func TestBuiltInReviewFindingsCatchesIntentionalBug(t *testing.T) {

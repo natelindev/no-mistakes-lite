@@ -157,20 +157,26 @@ func TestTimelineSpacesStepsWithBranchLine(t *testing.T) {
 	if !strings.HasPrefix(got, "◇  test") {
 		t.Fatalf("timeline should start with left aligned step marker, got %q", got)
 	}
-	if !strings.Contains(got, "\n│\n◴  docs") {
+	if !strings.Contains(got, "\n│\n⠋  docs") {
 		t.Fatalf("timeline should put a branch spacer between steps, got %q", got)
 	}
-	if strings.Contains(got, "│  ◇") || strings.Contains(got, "│  ◴") {
+	if strings.Contains(got, "│  ◇") || strings.Contains(got, "│  ⠋") {
 		t.Fatalf("timeline should not indent step markers under branch line: %q", got)
 	}
 }
 
-func TestSpinnerFramesStaySingleCellWithEastAsianWidth(t *testing.T) {
+func TestRunningIndicatorIsAnimated(t *testing.T) {
+	if !RunningIndicatorAnimated() {
+		t.Fatal("running indicator should animate")
+	}
+}
+
+func TestRunningIndicatorFramesStaySingleCellWithEastAsianWidth(t *testing.T) {
 	cond := runewidth.NewCondition()
 	cond.EastAsianWidth = true
-	for _, frame := range spinnerFrames {
+	for _, frame := range runningIndicatorFrames {
 		if got := cond.StringWidth(frame); got != 1 {
-			t.Fatalf("spinner frame %q has width %d, want 1", frame, got)
+			t.Fatalf("running indicator frame %q has width %d, want 1", frame, got)
 		}
 	}
 }

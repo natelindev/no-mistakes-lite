@@ -91,7 +91,8 @@ var (
 
 // Keep frames at one terminal cell even when East Asian ambiguous-width
 // characters are rendered wide. Mixed-width frames make the progress line jump.
-var spinnerFrames = []string{"◴", "◷", "◶", "◵"}
+// Use a compact Braille spinner instead of the heavier quadrant spinner.
+var runningIndicatorFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 func ShowRun(ctx context.Context, out io.Writer, state runstate.State) error {
 	program := tea.NewProgram(model{state: state}, tea.WithOutput(out), tea.WithContext(ctx))
@@ -436,7 +437,7 @@ func SelectHomeAction(ctx context.Context, in io.Reader, out io.Writer, state Ho
 }
 
 func (m model) Init() tea.Cmd {
-	if m.hasActiveStep() {
+	if m.hasActiveStep() && RunningIndicatorAnimated() {
 		return nextTick()
 	}
 	return nil
@@ -753,6 +754,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 	case tickMsg:
+		if !RunningIndicatorAnimated() {
+			return m, nil
+		}
 		m.spinner++
 		if m.hasActiveStep() {
 			return m, nextTick()
@@ -822,12 +826,19 @@ func statusMarker(status runstate.StepStatus, frame int) string {
 	case runstate.StatusFailed, runstate.StatusCancelled:
 		return "✖"
 	case runstate.StatusRunning, runstate.StatusFixing:
-		return spinnerFrames[frame%len(spinnerFrames)]
+		if len(runningIndicatorFrames) == 0 {
+			return "⠋"
+		}
+		return runningIndicatorFrames[frame%len(runningIndicatorFrames)]
 	case runstate.StatusAwaitingUser:
 		return "◆"
 	default:
 		return "◌"
 	}
+}
+
+func RunningIndicatorAnimated() bool {
+	return len(runningIndicatorFrames) > 1
 }
 
 func severityInitial(finding review.Finding) string {

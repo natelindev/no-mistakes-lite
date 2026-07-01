@@ -25,6 +25,7 @@ nml init --interactive                # guided setup wizard for humans
 nml doctor                            # check local tools, auth, config, and repo state
 nml run --message "fix: handle empty input"
 nml run --test-command "go test ./..."
+nml run --skip-review --test-command "go test ./..."
 nml status --format toon
 nml status --run <id> --full
 nml findings --format toon
@@ -65,7 +66,7 @@ The repository also carries an Agent Skill at `skills/no-mistakes-lite/SKILL.md`
 - Dirty worktree staging, agent-generated commit metadata, and commit hook fix retries.
 - Agent or fallback intent generation and JSON run state under `.git/nml/runs`, mirrored to `~/.nml/runs` with event and log files for resume.
 - Treehouse worktree leasing with completed-run auto-cleanup, current Treehouse worktree reuse, exact source commit reuse, and cherry-pick or format-patch fallback.
-- First review loop using configured agents, exact `LGTM`, Markdown finding parsing, review gate output, and `--yes` or `--yolo` automatic fix attempts.
+- First review loop using configured agents, exact `LGTM`, Markdown finding parsing, review gate output, `--skip-review`, and `--yes` or `--yolo` automatic fix attempts.
 - Test command execution only when configured per repo or supplied per run, plus lint command execution with skip reasons and agent fix retries.
 - Docs evaluation and optional agent documentation updates.
 - GitHub remote detection, safe push of tool-owned `nml/*` branches, and GitHub PR create/update through `gh` when available.

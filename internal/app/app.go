@@ -148,6 +148,7 @@ type runOptions struct {
 	Yes              bool
 	Yolo             bool
 	YoloSet          bool
+	SkipReview       bool
 	Message          string
 	MessageFromAgent bool
 	Paths            []string
@@ -218,6 +219,7 @@ func (a App) run(ctx context.Context, args []string) int {
 	fs.SetOutput(io.Discard)
 	fs.BoolVar(&opts.Yes, "yes", false, "accept safe defaults and do not prompt")
 	fs.BoolVar(&opts.Yolo, "yolo", false, "auto-select all actionable findings")
+	fs.BoolVar(&opts.SkipReview, "skip-review", false, "skip the entire review phase for this run")
 	fs.StringVar(&opts.Message, "message", "", "commit message for dirty worktree")
 	fs.BoolVar(&opts.MessageFromAgent, "message-from-agent", false, "ask the configured agent to generate a commit message")
 	fs.Var(&paths, "paths", "comma-separated path list to stage instead of all changes")
@@ -769,6 +771,10 @@ type reviewOutcome struct {
 }
 
 func (a App) runReview(ctx context.Context, cfg config.Config, opts runOptions, run *runstate.State) (reviewOutcome, error) {
+	if opts.SkipReview {
+		run.SetStep("review", runstate.StatusSkipped, "skipped by --skip-review")
+		return reviewOutcome{}, nil
+	}
 	if cfg.Agent.Name == "" {
 		run.SetStep("review", runstate.StatusSkipped, "no configured agent; run nml init to enable review")
 		return reviewOutcome{}, nil
@@ -2616,6 +2622,7 @@ func (a App) resume(ctx context.Context, args []string) int {
 	fs.StringVar(&runRef, "run", "", "run id or path")
 	fs.BoolVar(&opts.Yes, "yes", false, "accept safe defaults without prompts")
 	fs.BoolVar(&opts.Yolo, "yolo", false, "auto-fix all actionable review findings")
+	fs.BoolVar(&opts.SkipReview, "skip-review", false, "skip the entire review phase for this resume")
 	fs.BoolVar(&opts.SkipDocs, "skip-docs", false, "skip docs for this resume")
 	fs.BoolVar(&opts.SkipDeploy, "skip-deploy", false, "skip deploy for this resume")
 	fs.BoolVar(&opts.AutoMerge, "auto-merge", false, "enable auto-merge for this resume")
@@ -2711,7 +2718,7 @@ func (a App) continueRun(ctx context.Context, options cfgLoadOptions, state runs
 		return ExitError
 	}
 	applyPersistentRunOptions(cfg, &options.RunOptions)
-	if reviewStatus := stepStatus(state, "review"); reviewStatus == runstate.StatusAwaitingUser && !options.RunOptions.Yolo {
+	if reviewStatus := stepStatus(state, "review"); reviewStatus == runstate.StatusAwaitingUser && !options.RunOptions.Yolo && !options.RunOptions.SkipReview {
 		printReviewGate(a.Out, state, options.StatePath, latestReviewFindings(state))
 		return ExitOK
 	}
@@ -3833,7 +3840,7 @@ func (a App) beginPipelineProgress() {
 func (a App) progress(format string, args ...any) {
 	message := fmt.Sprintf(format, args...)
 	if a.Interactive {
-		fmt.Fprint(a.Err, tui.RenderProgressStep(runstate.StatusRunning, message, 2))
+		fmt.Fprint(a.Err, tui.RenderProgressStep(runstate.StatusRunning, message, 0))
 		return
 	}
 	fmt.Fprintf(a.Err, "nml: %s\n", message)
@@ -3846,23 +3853,29 @@ func (a App) withSpinner(ctx context.Context, label string, fn func() error) err
 	}
 	done := make(chan error, 1)
 	go func() { done <- fn() }()
-	ticker := time.NewTicker(120 * time.Millisecond)
-	defer ticker.Stop()
 	frame := 0
 	render := func() {
 		fmt.Fprintf(a.Err, "\r\033[K%s", tui.RenderProgressInline(runstate.StatusRunning, label, frame))
 	}
+	finish := func(err error) error {
+		fmt.Fprint(a.Err, "\r\033[K")
+		if err != nil {
+			fmt.Fprint(a.Err, tui.RenderProgressStep(runstate.StatusFailed, label, frame))
+		} else {
+			fmt.Fprint(a.Err, tui.RenderProgressStep(runstate.StatusCompleted, label, frame))
+		}
+		return err
+	}
 	render()
+	if !tui.RunningIndicatorAnimated() {
+		return finish(<-done)
+	}
+	ticker := time.NewTicker(120 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		select {
 		case err := <-done:
-			fmt.Fprint(a.Err, "\r\033[K")
-			if err != nil {
-				fmt.Fprint(a.Err, tui.RenderProgressStep(runstate.StatusFailed, label, frame))
-			} else {
-				fmt.Fprint(a.Err, tui.RenderProgressStep(runstate.StatusCompleted, label, frame))
-			}
-			return err
+			return finish(err)
 		case <-ticker.C:
 			frame++
 			render()
@@ -3989,6 +4002,7 @@ func printRunHelp(w io.Writer) {
 	fmt.Fprintln(w, "  --paths <a,b>             stage selected paths instead of all changes (default: all)")
 	fmt.Fprintln(w, "  --yes                     accept safe defaults without prompts (default: false)")
 	fmt.Fprintln(w, "  --yolo                    auto-select all actionable findings (default: config value)")
+	fmt.Fprintln(w, "  --skip-review             skip the entire review phase (default: false)")
 	fmt.Fprintln(w, "  --auto-merge              enable auto-merge for this run (default: config value)")
 	fmt.Fprintln(w, "  --merge-method <method>   squash, merge, or rebase (default: config value)")
 	fmt.Fprintln(w, "  --skip-docs               skip docs for this run (default: false)")
@@ -3999,6 +4013,7 @@ func printRunHelp(w io.Writer) {
 	fmt.Fprintln(w, "Examples:")
 	fmt.Fprintln(w, "  nml run --message \"fix: handle empty input\"")
 	fmt.Fprintln(w, "  nml run --paths src/a.go,src/b.go --message \"fix: limit parser scope\"")
+	fmt.Fprintln(w, "  nml run --test-command \"go test ./...\" --skip-review")
 	fmt.Fprintln(w, "  nml run --test-command \"go test ./...\" --skip-deploy")
 }
 
@@ -4111,6 +4126,7 @@ func printResumeHelp(w io.Writer) {
 	fmt.Fprintln(w, "  --run <id|path>        resume a specific run (default: latest resumable)")
 	fmt.Fprintln(w, "  --yes                  accept safe defaults without prompts (default: false)")
 	fmt.Fprintln(w, "  --yolo                 auto-fix all actionable review findings (default: config value)")
+	fmt.Fprintln(w, "  --skip-review          skip the entire review phase (default: false)")
 	fmt.Fprintln(w, "  --skip-docs            skip docs for this resume (default: false)")
 	fmt.Fprintln(w, "  --skip-deploy          skip deploy for this resume (default: false)")
 	fmt.Fprintln(w, "  --auto-merge           enable auto-merge for this resume (default: config value)")
@@ -4119,6 +4135,7 @@ func printResumeHelp(w io.Writer) {
 	fmt.Fprintln(w, "Examples:")
 	fmt.Fprintln(w, "  nml resume")
 	fmt.Fprintln(w, "  nml resume --run <id>")
+	fmt.Fprintln(w, "  nml resume --run <id> --skip-review")
 	fmt.Fprintln(w, "  nml resume --run <id> --test-command \"go test ./...\"")
 }
 
