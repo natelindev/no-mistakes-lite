@@ -317,8 +317,7 @@ func (a App) run(ctx context.Context, args []string) int {
 			run.Intent = fallbackIntent(message, diffStat, "")
 			run.SetStep("intent", runstate.StatusCompleted, "intent generated from commit message and worktree diff")
 		}
-		a.progress("staging changes")
-		if err := client.Add(ctx, opts.Paths); err != nil {
+		if err := a.withSpinner(ctx, "staging changes", func() error { return client.Add(ctx, opts.Paths) }); err != nil {
 			toon.Error(a.Out, err.Error(), []string{"Check the --paths value and retry."})
 			return ExitError
 		}
@@ -332,7 +331,6 @@ func (a App) run(ctx context.Context, args []string) int {
 			toon.KV(a.Out, "reason", "selected paths have no staged changes")
 			return ExitOK
 		}
-		a.progress("committing dirty worktree")
 		out, err := a.commitWithHookFix(ctx, cfg, client, &run, message)
 		if err != nil {
 			run.SetStep("commit", runstate.StatusFailed, redact.Secrets(out))
@@ -511,7 +509,16 @@ func (a App) commitWithHookFix(ctx context.Context, cfg config.Config, client gi
 	attempts := 3
 	var lastOut string
 	for attempt := 1; attempt <= attempts; attempt++ {
-		out, err := client.Commit(ctx, message)
+		label := "committing dirty worktree"
+		if attempt > 1 {
+			label = fmt.Sprintf("retrying commit after hook fix (%d/%d)", attempt, attempts)
+		}
+		var out string
+		err := a.withSpinner(ctx, label, func() error {
+			var commitErr error
+			out, commitErr = client.Commit(ctx, message)
+			return commitErr
+		})
 		lastOut = out
 		if err == nil {
 			return out, nil
@@ -523,7 +530,7 @@ func (a App) commitWithHookFix(ctx context.Context, cfg config.Config, client gi
 		if fixErr := a.fixCommitHookFailure(ctx, cfg, run, redact.Secrets(out)); fixErr != nil {
 			return lastOut, fixErr
 		}
-		if addErr := client.Add(ctx, nil); addErr != nil {
+		if addErr := a.withSpinner(ctx, "staging hook fixes", func() error { return client.Add(ctx, nil) }); addErr != nil {
 			return lastOut, addErr
 		}
 	}
@@ -600,7 +607,7 @@ func (a App) prepareWorktree(ctx context.Context, cfg config.Config, source gitx
 	}
 	run.WorktreePath = worktreePath
 	target := gitx.Client{Dir: worktreePath}
-	a.progress("preparing review branch %s", run.ReviewBranch)
+	a.progressDone("preparing review branch %s", run.ReviewBranch)
 	if err := a.withSpinner(ctx, "fetching base branch in leased worktree", func() error { return target.Fetch(ctx, run.Remote, run.MainBranch) }); err != nil {
 		a.warn("worktree fetch failed: %v", err)
 	}
@@ -657,7 +664,7 @@ func (a App) prepareSourceTreehouseWorktree(ctx context.Context, source gitx.Cli
 		return worktreePrep{}, fmt.Errorf("source treehouse worktree path is empty")
 	}
 	run.WorktreePath = worktreePath
-	a.progress("reusing current treehouse worktree %s", worktreePath)
+	a.progressDone("reusing current treehouse worktree %s", worktreePath)
 	if err := a.withSpinner(ctx, "fetching base branch in current treehouse worktree", func() error { return source.Fetch(ctx, run.Remote, run.MainBranch) }); err != nil {
 		a.warn("worktree fetch failed: %v", err)
 	}
@@ -3869,6 +3876,15 @@ func (a App) progress(format string, args ...any) {
 	message := fmt.Sprintf(format, args...)
 	if a.Interactive {
 		fmt.Fprint(a.Err, tui.RenderProgressStep(runstate.StatusRunning, message, 0))
+		return
+	}
+	fmt.Fprintf(a.Err, "nml: %s\n", message)
+}
+
+func (a App) progressDone(format string, args ...any) {
+	message := fmt.Sprintf(format, args...)
+	if a.Interactive {
+		fmt.Fprint(a.Err, tui.RenderProgressStep(runstate.StatusCompleted, message, 0))
 		return
 	}
 	fmt.Fprintf(a.Err, "nml: %s\n", message)

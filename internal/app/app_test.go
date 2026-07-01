@@ -201,6 +201,20 @@ func TestInteractiveProgressUsesLeftAlignedTUIStep(t *testing.T) {
 	}
 }
 
+func TestInteractiveProgressDoneUsesCompletedMarker(t *testing.T) {
+	var errw bytes.Buffer
+	app := App{Err: &errw, Interactive: true}
+	app.progressDone("reusing current treehouse worktree %s", "/tmp/worktree")
+	got := appStripANSI(errw.String())
+	want := "◇  reusing current treehouse worktree /tmp/worktree\n│\n"
+	if got != want {
+		t.Fatalf("progress done output = %q, want %q", got, want)
+	}
+	if strings.Contains(got, "│  ◇") {
+		t.Fatalf("progress marker should be left aligned, got %q", got)
+	}
+}
+
 func TestRunValidationCommandsSkipsEmptyTestWithoutDetection(t *testing.T) {
 	worktree := t.TempDir()
 	if err := os.WriteFile(filepath.Join(worktree, "go.mod"), []byte("module example.com/test\n"), 0o644); err != nil {
