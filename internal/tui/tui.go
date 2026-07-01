@@ -89,7 +89,9 @@ var (
 	selectedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("86"))
 )
 
-var spinnerFrames = []string{"◐", "◓", "◑", "◒"}
+// Keep frames at one terminal cell even when East Asian ambiguous-width
+// characters are rendered wide. Mixed-width frames make the progress line jump.
+var spinnerFrames = []string{"◴", "◷", "◶", "◵"}
 
 func ShowRun(ctx context.Context, out io.Writer, state runstate.State) error {
 	program := tea.NewProgram(model{state: state}, tea.WithOutput(out), tea.WithContext(ctx))

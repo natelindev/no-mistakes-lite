@@ -192,11 +192,11 @@ func TestInteractiveProgressUsesLeftAlignedTUIStep(t *testing.T) {
 	app := App{Err: &errw, Interactive: true}
 	app.progress("checking documentation")
 	got := appStripANSI(errw.String())
-	want := "◑  checking documentation\n│\n"
+	want := "◶  checking documentation\n│\n"
 	if got != want {
 		t.Fatalf("progress output = %q, want %q", got, want)
 	}
-	if strings.Contains(got, "│  ◑") {
+	if strings.Contains(got, "│  ◶") {
 		t.Fatalf("progress marker should be left aligned, got %q", got)
 	}
 }

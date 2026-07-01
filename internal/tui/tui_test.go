@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/natelindev/no-mistakes-lite/internal/review"
 	"github.com/natelindev/no-mistakes-lite/internal/runstate"
+	"github.com/mattn/go-runewidth"
 )
 
 func TestSelectModelSpaceSelectsCursor(t *testing.T) {
@@ -156,11 +157,21 @@ func TestTimelineSpacesStepsWithBranchLine(t *testing.T) {
 	if !strings.HasPrefix(got, "◇  test") {
 		t.Fatalf("timeline should start with left aligned step marker, got %q", got)
 	}
-	if !strings.Contains(got, "\n│\n◐  docs") {
+	if !strings.Contains(got, "\n│\n◴  docs") {
 		t.Fatalf("timeline should put a branch spacer between steps, got %q", got)
 	}
-	if strings.Contains(got, "│  ◇") || strings.Contains(got, "│  ◐") {
+	if strings.Contains(got, "│  ◇") || strings.Contains(got, "│  ◴") {
 		t.Fatalf("timeline should not indent step markers under branch line: %q", got)
+	}
+}
+
+func TestSpinnerFramesStaySingleCellWithEastAsianWidth(t *testing.T) {
+	cond := runewidth.NewCondition()
+	cond.EastAsianWidth = true
+	for _, frame := range spinnerFrames {
+		if got := cond.StringWidth(frame); got != 1 {
+			t.Fatalf("spinner frame %q has width %d, want 1", frame, got)
+		}
 	}
 }
 
