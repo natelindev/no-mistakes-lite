@@ -166,8 +166,29 @@ func (c Client) RemoteURL(ctx context.Context, remote string) (string, error) {
 }
 
 func (c Client) Fetch(ctx context.Context, remote, branch string) error {
-	_, err := c.Run(ctx, "fetch", "--quiet", remote, branch)
+	if remote == "" {
+		remote = "origin"
+	}
+	if branch == "" {
+		branch = "main"
+	}
+	refspec := fmt.Sprintf("+refs/heads/%s:refs/remotes/%s/%s", branch, remote, branch)
+	_, err := c.Run(ctx, "fetch", "--quiet", remote, refspec)
 	return err
+}
+
+func (c Client) IsAncestor(ctx context.Context, ancestor, descendant string) (bool, error) {
+	_, err := c.Run(ctx, "merge-base", "--is-ancestor", ancestor, descendant)
+	if err == nil {
+		return true, nil
+	}
+	var ce *CommandError
+	if errors.As(err, &ce) {
+		if exitErr, ok := ce.Err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return false, nil
+		}
+	}
+	return false, err
 }
 
 func (c Client) AheadBehind(ctx context.Context, baseRef, headRef string) (ahead int, behind int, err error) {

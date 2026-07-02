@@ -622,7 +622,7 @@ func (a App) prepareWorktree(ctx context.Context, cfg config.Config, source gitx
 		return worktreePrep{Path: worktreePath}, fmt.Errorf("no commits found in range %s..HEAD", run.BaseRef)
 	}
 	if err := a.withSpinner(ctx, fmt.Sprintf("copying %d source commits into isolated worktree", len(commits)), func() error {
-		return checkoutSourceHead(ctx, target, source, run.ReviewBranch, run.SourceHead)
+		return checkoutSourceHead(ctx, target, source, run.ReviewBranch, run.SourceHead, run.BaseRef)
 	}); err == nil {
 		return worktreePrep{Path: worktreePath, CommitCount: len(commits), Method: "source-head"}, nil
 	} else {
@@ -691,7 +691,7 @@ func (a App) prepareSourceTreehouseWorktree(ctx context.Context, source gitx.Cli
 	return worktreePrep{Path: worktreePath, CommitCount: len(commits), Method: "source-worktree"}, nil
 }
 
-func checkoutSourceHead(ctx context.Context, target, source gitx.Client, reviewBranch, sourceHead string) error {
+func checkoutSourceHead(ctx context.Context, target, source gitx.Client, reviewBranch, sourceHead, baseRef string) error {
 	sourceDir := strings.TrimSpace(source.Dir)
 	if sourceDir == "" {
 		return fmt.Errorf("source git directory is required")
@@ -712,6 +712,15 @@ func checkoutSourceHead(ctx context.Context, target, source gitx.Client, reviewB
 	}
 	if strings.TrimSpace(out) != strings.TrimSpace(sourceHead) {
 		return fmt.Errorf("fetched source HEAD %s, expected %s", strings.TrimSpace(out), strings.TrimSpace(sourceHead))
+	}
+	if strings.TrimSpace(baseRef) != "" {
+		ok, err := target.IsAncestor(ctx, baseRef, "FETCH_HEAD")
+		if err != nil {
+			return fmt.Errorf("verify source HEAD ancestry against %s: %w", baseRef, err)
+		}
+		if !ok {
+			return fmt.Errorf("source HEAD is not based on current base %s", baseRef)
+		}
 	}
 	return target.CheckoutBranch(ctx, reviewBranch, "FETCH_HEAD")
 }
@@ -1490,7 +1499,25 @@ func (a App) runCIWatch(ctx context.Context, cfg config.Config, opts runOptions,
 	timeout := durationOrDefault(opts.CITimeout, cfg.CI.Timeout, 30*time.Minute)
 	interval := durationOrDefault("", cfg.CI.PollInterval, 20*time.Second)
 	attempts := 3
-	for attempt := 1; attempt <= attempts; attempt++ {
+	maxMergeConflictFixes := 2
+	mergeConflictFixes := 0
+	for attempt := 1; attempt <= attempts; {
+		if detail, conflict, inspectErr := inspectPRMergeConflict(ctx, ghPath, run.WorktreePath, run.PRURL); inspectErr != nil {
+			a.warn("PR merge-state check failed: %v", inspectErr)
+		} else if conflict {
+			if mergeConflictFixes >= maxMergeConflictFixes {
+				run.SetStep("ci", runstate.StatusFailed, detail)
+				return fmt.Errorf("PR still has merge conflicts after %d resolution attempts: %s", mergeConflictFixes, detail)
+			}
+			mergeConflictFixes++
+			run.SetStep("ci", runstate.StatusFixing, fmt.Sprintf("attempt %d resolving PR merge conflict", mergeConflictFixes))
+			if err := a.resolvePRMergeConflict(ctx, cfg, opts, run, detail); err != nil {
+				run.SetStep("ci", runstate.StatusFailed, err.Error())
+				return err
+			}
+			continue
+		}
+
 		run.SetStep("ci", runstate.StatusRunning, fmt.Sprintf("watching GitHub checks, attempt %d", attempt))
 		var out string
 		var status string
@@ -1499,7 +1526,7 @@ func (a App) runCIWatch(ctx context.Context, cfg config.Config, opts runOptions,
 			out, status, watchErr = watchPRChecks(ctx, ghPath, run.WorktreePath, run.PRURL, timeout, interval)
 			return watchErr
 		})
-		_, _ = session.WriteLog(*run, fmt.Sprintf("ci-checks-attempt-%d.log", attempt), out)
+		_, _ = session.WriteLog(*run, fmt.Sprintf("ci-checks-attempt-%d.log", attempt), redact.Secrets(out))
 		if status == "passed" {
 			run.SetStep("ci", runstate.StatusCompleted, commandDetail("gh pr checks", out))
 			return nil
@@ -1539,7 +1566,7 @@ func (a App) runCIWatch(ctx context.Context, cfg config.Config, opts runOptions,
 			logs = collectCILogs(ctx, ghPath, run.WorktreePath, run.ReviewBranch)
 			return nil
 		})
-		_, _ = session.WriteLog(*run, fmt.Sprintf("ci-failed-logs-attempt-%d.log", attempt), logs)
+		_, _ = session.WriteLog(*run, fmt.Sprintf("ci-failed-logs-attempt-%d.log", attempt), redact.Secrets(logs))
 		run.SetStep("ci", runstate.StatusFixing, fmt.Sprintf("attempt %d fixing failed checks", attempt))
 		changed, fixErr := a.fixCIFailure(ctx, cfg, run, detail, logs)
 		if fixErr != nil {
@@ -1560,8 +1587,245 @@ func (a App) runCIWatch(ctx context.Context, cfg config.Config, opts runOptions,
 		} else {
 			a.warn("CI fix attempt made no commits or file changes")
 		}
+		attempt++
 	}
 	return fmt.Errorf("CI did not complete")
+}
+
+type prMergeState struct {
+	MergeStateStatus string
+	Mergeable        string
+	HeadRefName      string
+	BaseRefName      string
+	IsDraft          bool
+}
+
+func inspectPRMergeConflict(ctx context.Context, ghPath, cwd, prURL string) (string, bool, error) {
+	if strings.TrimSpace(prURL) == "" {
+		return "", false, nil
+	}
+	state, err := inspectPRMergeState(ctx, ghPath, cwd, prURL)
+	if err != nil {
+		return "", false, err
+	}
+	detail, conflict := prMergeConflictDetail(state)
+	return detail, conflict, nil
+}
+
+func inspectPRMergeState(ctx context.Context, ghPath, cwd, prURL string) (prMergeState, error) {
+	out, err := runGH(ctx, ghPath, cwd, "pr", "view", prURL, "--json", "mergeStateStatus,mergeable,headRefName,baseRefName,isDraft")
+	if err != nil {
+		return prMergeState{}, err
+	}
+	var raw struct {
+		MergeStateStatus string `json:"mergeStateStatus"`
+		Mergeable        any    `json:"mergeable"`
+		HeadRefName      string `json:"headRefName"`
+		BaseRefName      string `json:"baseRefName"`
+		IsDraft          bool   `json:"isDraft"`
+	}
+	if err := json.Unmarshal([]byte(out), &raw); err != nil {
+		return prMergeState{}, fmt.Errorf("parse PR merge state: %w: %s", err, truncate(redact.Secrets(out), 1000))
+	}
+	return prMergeState{
+		MergeStateStatus: strings.TrimSpace(raw.MergeStateStatus),
+		Mergeable:        strings.TrimSpace(jsonScalarString(raw.Mergeable)),
+		HeadRefName:      strings.TrimSpace(raw.HeadRefName),
+		BaseRefName:      strings.TrimSpace(raw.BaseRefName),
+		IsDraft:          raw.IsDraft,
+	}, nil
+}
+
+func jsonScalarString(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case bool:
+		if v {
+			return "true"
+		}
+		return "false"
+	default:
+		return fmt.Sprint(v)
+	}
+}
+
+func prMergeConflictDetail(state prMergeState) (string, bool) {
+	mergeState := strings.ToUpper(strings.TrimSpace(state.MergeStateStatus))
+	mergeable := strings.ToUpper(strings.TrimSpace(state.Mergeable))
+	if mergeState != "DIRTY" && mergeable != "CONFLICTING" {
+		return "", false
+	}
+	parts := []string{}
+	if state.BaseRefName != "" {
+		parts = append(parts, "base="+state.BaseRefName)
+	}
+	if state.HeadRefName != "" {
+		parts = append(parts, "head="+state.HeadRefName)
+	}
+	if mergeState != "" {
+		parts = append(parts, "merge_state="+mergeState)
+	}
+	if mergeable != "" {
+		parts = append(parts, "mergeable="+mergeable)
+	}
+	detail := "PR has merge conflicts"
+	if len(parts) > 0 {
+		detail += " (" + strings.Join(parts, ", ") + ")"
+	}
+	return detail, true
+}
+
+func (a App) resolvePRMergeConflict(ctx context.Context, cfg config.Config, opts runOptions, run *runstate.State, detail string) error {
+	_, _ = session.WriteLog(*run, "pr-merge-conflict.log", redact.Secrets(detail))
+	run.SetStep("ci", runstate.StatusFixing, detail+"; rebasing review branch onto "+run.BaseRef)
+	if err := a.rebaseReviewBranchOntoBase(ctx, cfg, run, detail); err != nil {
+		return err
+	}
+	if err := a.runValidationCommands(ctx, cfg, opts, run); err != nil {
+		return err
+	}
+	if err := a.withSpinner(ctx, "pushing PR merge conflict fix", func() error {
+		return pushReviewBranch(ctx, gitx.Client{Dir: run.WorktreePath}, run.Remote, run.ReviewBranch)
+	}); err != nil {
+		run.SetStep("push", runstate.StatusFailed, err.Error())
+		return err
+	}
+	run.SetStep("push", runstate.StatusCompleted, "pushed PR merge conflict fix to "+run.Remote)
+	run.SetStep("ci", runstate.StatusRunning, "PR merge conflict resolved; waiting for checks")
+	return nil
+}
+
+func (a App) rebaseReviewBranchOntoBase(ctx context.Context, cfg config.Config, run *runstate.State, conflictDetail string) error {
+	client := gitx.Client{Dir: run.WorktreePath}
+	if strings.TrimSpace(run.BaseRef) == "" {
+		return fmt.Errorf("run state is missing base ref for PR merge conflict resolution")
+	}
+	if strings.TrimSpace(run.ReviewBranch) != "" {
+		if _, err := client.Run(ctx, "checkout", run.ReviewBranch); err != nil {
+			return fmt.Errorf("checkout review branch %s: %w", run.ReviewBranch, err)
+		}
+	}
+	status, err := client.StatusPorcelain(ctx)
+	if err != nil {
+		return err
+	}
+	if gitx.IsDirty(status) {
+		return fmt.Errorf("worktree is dirty before PR merge conflict resolution: %s", truncate(strings.TrimSpace(status), 1000))
+	}
+	if err := a.withSpinner(ctx, "fetching base branch before conflict resolution", func() error {
+		return client.Fetch(ctx, run.Remote, run.MainBranch)
+	}); err != nil {
+		return fmt.Errorf("fetch base branch before conflict resolution: %w", err)
+	}
+	if !client.RefExists(ctx, run.BaseRef) {
+		return fmt.Errorf("base ref %s is not available after fetch", run.BaseRef)
+	}
+	out, err := a.withSpinnerOutput(ctx, "rebasing review branch onto "+run.BaseRef, func() (string, error) {
+		return client.Run(ctx, "rebase", run.BaseRef)
+	})
+	_, _ = session.WriteLog(*run, "pr-merge-conflict-rebase.log", redact.Secrets(out))
+	if err == nil {
+		return ensureCleanRebaseWorktree(ctx, client)
+	}
+	if cfg.Agent.Name == "" {
+		_, _ = client.Run(ctx, "rebase", "--abort")
+		return fmt.Errorf("%s; local rebase failed and no agent is configured to resolve conflicts: %s", conflictDetail, redact.Secrets(commandDetail("git rebase "+run.BaseRef, out)))
+	}
+	if fixErr := a.fixRebaseConflicts(ctx, cfg, run, conflictDetail, out); fixErr != nil {
+		_, _ = client.Run(ctx, "rebase", "--abort")
+		return fixErr
+	}
+	return ensureCleanRebaseWorktree(ctx, client)
+}
+
+func ensureCleanRebaseWorktree(ctx context.Context, client gitx.Client) error {
+	status, err := client.StatusPorcelain(ctx)
+	if err != nil {
+		return err
+	}
+	if gitx.IsDirty(status) {
+		return fmt.Errorf("rebase finished with uncommitted changes: %s", truncate(strings.TrimSpace(status), 1000))
+	}
+	return nil
+}
+
+func (a App) fixRebaseConflicts(ctx context.Context, cfg config.Config, run *runstate.State, conflictDetail, rebaseOutput string) error {
+	pathOverride := ""
+	if cfg.Agent.PathOverrides != nil {
+		pathOverride = strings.TrimSpace(cfg.Agent.PathOverrides[cfg.Agent.Name])
+	}
+	runner, err := agent.New(cfg.Agent.Name, pathOverride)
+	if err != nil {
+		return err
+	}
+	client := gitx.Client{Dir: run.WorktreePath}
+	lastOutput := rebaseOutput
+	for attempt := 1; attempt <= 5; attempt++ {
+		status, _ := client.StatusPorcelain(ctx)
+		prompt := fmt.Sprintf(`Resolve the current git rebase conflicts for this PR.
+
+Original user intent:
+%s
+
+PR merge state:
+%s
+
+Rebase output:
+%s
+
+Git status:
+%s
+
+Rules:
+- Resolve conflicts by preserving the original user intent and current base branch behavior.
+- Do not broaden scope.
+- Do not run git rebase --continue, git rebase --abort, or commit. nml will continue the rebase.
+- Leave all resolved files in the worktree.`, run.Intent, conflictDetail, truncate(redact.Secrets(lastOutput), 40000), status)
+		_, err := a.withSpinnerAgent(ctx, fmt.Sprintf("resolving PR merge conflicts (attempt %d)", attempt), func() (agent.Response, error) {
+			return runner.Run(ctx, agent.Request{
+				CWD:          run.WorktreePath,
+				SystemPrompt: mutatingAgentSystemPrompt(),
+				Prompt:       prompt,
+				Expect:       agent.ExpectText,
+				Model:        cfg.Agent.Model,
+				ExtraArgs:    cfg.Agent.ExtraArgs,
+			})
+		})
+		if err != nil {
+			return err
+		}
+		if err := client.Add(ctx, nil); err != nil {
+			return err
+		}
+		out, err := continueRebase(ctx, client)
+		lastOutput = out
+		_, _ = session.WriteLog(*run, fmt.Sprintf("pr-merge-conflict-rebase-continue-%d.log", attempt), redact.Secrets(out))
+		if err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("PR merge conflicts were not resolved after 5 attempts: %s", truncate(redact.Secrets(lastOutput), 4000))
+}
+
+func continueRebase(ctx context.Context, client gitx.Client) (string, error) {
+	out, err := client.Run(ctx, "-c", "core.editor=true", "rebase", "--continue")
+	if err == nil {
+		return out, nil
+	}
+	if rebaseCommitBecameEmpty(out) {
+		skipOut, skipErr := client.Run(ctx, "rebase", "--skip")
+		combined := strings.TrimSpace(out + "\n" + skipOut)
+		return combined, skipErr
+	}
+	return out, err
+}
+
+func rebaseCommitBecameEmpty(out string) bool {
+	lower := strings.ToLower(out)
+	return strings.Contains(lower, "no changes") || strings.Contains(lower, "previous cherry-pick is now empty") || strings.Contains(lower, "patch contents already upstream")
 }
 
 type ghRunFunc func(context.Context, string, string, ...string) (string, error)

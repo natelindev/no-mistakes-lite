@@ -48,6 +48,7 @@ Common run flags:
 - `review.auto_approve_after_rounds=true` lets configured auto-fix runs continue after the configured review rounds even if findings remain. Use only with explicit user consent.
 - `--skip-review` skips the entire review phase, including configured agent review and built-in review checks.
 - `--auto-merge` makes nml run `gh pr merge` after checks pass. It does not use GitHub's repository-level auto-merge feature. GitHub CLI prompts are disabled, so failures are reported instead of waiting for terminal input. Use only with explicit user consent.
+- Before watching CI, nml checks PR merge state. If GitHub reports merge conflicts, nml rebases the review branch onto the current base, asks the configured agent to resolve local rebase conflicts when needed, re-runs validation, force-pushes, and watches checks again.
 - Runs with `--yolo`, explicit review skips, or auto-approved unresolved review findings require reported CI checks; nml waits briefly for checks to register before failing if none appear.
 - `--skip-docs`, `--skip-deploy`, `--ci-timeout <duration>`, `--merge-method <squash|merge|rebase>`, and `--fetch <bool>` tune the run.
 - Persist defaults with `nml config --interactive`, `nml config --scope project --set review.yolo=true --set ci.timeout=15m`, `nml config --scope project --set review.auto_approve_after_rounds=true`, or `nml config --scope global --set auto_merge.enabled=true`. Project settings override global settings.

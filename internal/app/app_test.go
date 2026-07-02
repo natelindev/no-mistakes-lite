@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/natelindev/no-mistakes-lite/internal/config"
+	gitx "github.com/natelindev/no-mistakes-lite/internal/git"
 	"github.com/natelindev/no-mistakes-lite/internal/review"
 	"github.com/natelindev/no-mistakes-lite/internal/runstate"
 )
@@ -464,6 +465,113 @@ func TestCIRequiresReportedChecksForRiskyReviewModes(t *testing.T) {
 	autoApproved.SetStep("review", runstate.StatusCompleted, "round 3 found 2 findings; auto-approved after configured review rounds")
 	if !ciRequiresReportedChecks(runOptions{}, autoApproved) {
 		t.Fatal("auto-approved unresolved review findings should require reported checks")
+	}
+}
+
+func TestPRMergeConflictDetailDetectsDirtyState(t *testing.T) {
+	detail, conflict := prMergeConflictDetail(prMergeState{MergeStateStatus: "DIRTY", Mergeable: "CONFLICTING", HeadRefName: "nml/test", BaseRefName: "main"})
+	if !conflict {
+		t.Fatal("expected DIRTY PR merge state to be treated as a conflict")
+	}
+	for _, want := range []string{"PR has merge conflicts", "base=main", "head=nml/test", "merge_state=DIRTY", "mergeable=CONFLICTING"} {
+		if !strings.Contains(detail, want) {
+			t.Fatalf("detail missing %q: %s", want, detail)
+		}
+	}
+	if _, conflict := prMergeConflictDetail(prMergeState{MergeStateStatus: "CLEAN", Mergeable: "MERGEABLE"}); conflict {
+		t.Fatal("clean PR merge state should not be treated as a conflict")
+	}
+}
+
+func TestRunCIWatchRebasesPRMergeConflictBeforeWatchingChecks(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	t.Setenv("HOME", home)
+	repo := newAppTestRepo(t, filepath.Join(root, "repo"))
+	bareRemote := filepath.Join(root, "remote.git")
+	runGitAppTest(t, root, "init", "--bare", bareRemote)
+	runGitAppTest(t, repo, "remote", "add", "origin", bareRemote)
+	runGitAppTest(t, repo, "push", "origin", "main")
+	runGitAppTest(t, repo, "checkout", "-b", "nml/test")
+	if err := os.WriteFile(filepath.Join(repo, "feature.txt"), []byte("feature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAppTest(t, repo, "add", "feature.txt")
+	runGitAppTest(t, repo, "commit", "-m", "feat: add feature")
+	runGitAppTest(t, repo, "push", "origin", "nml/test")
+	runGitAppTest(t, repo, "fetch", "origin", "refs/heads/nml/test:refs/remotes/origin/nml/test")
+	runGitAppTest(t, repo, "checkout", "main")
+	if err := os.WriteFile(filepath.Join(repo, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAppTest(t, repo, "add", "base.txt")
+	runGitAppTest(t, repo, "commit", "-m", "feat: advance base")
+	runGitAppTest(t, repo, "push", "origin", "main")
+	runGitAppTest(t, repo, "checkout", "nml/test")
+
+	fakeGH := filepath.Join(root, "gh")
+	ghState := filepath.Join(root, "gh-state")
+	ghLog := filepath.Join(root, "gh.log")
+	ghScript := `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$NML_FAKE_GH_LOG"
+case "${1:-} ${2:-}" in
+  "pr view")
+    count=0
+    if [ -f "$NML_FAKE_GH_STATE" ]; then
+      count="$(cat "$NML_FAKE_GH_STATE")"
+    fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$NML_FAKE_GH_STATE"
+    if [ "$count" -eq 1 ]; then
+      printf '{"mergeStateStatus":"DIRTY","mergeable":"CONFLICTING","headRefName":"nml/test","baseRefName":"main","isDraft":false}\n'
+    else
+      printf '{"mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","headRefName":"nml/test","baseRefName":"main","isDraft":false}\n'
+    fi
+    ;;
+  "pr checks")
+    echo "All checks were successful"
+    ;;
+  *)
+    echo "unexpected gh command: $*" >&2
+    exit 2
+    ;;
+esac
+`
+	if err := os.WriteFile(fakeGH, []byte(ghScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NML_FAKE_GH_STATE", ghState)
+	t.Setenv("NML_FAKE_GH_LOG", ghLog)
+
+	cfg := config.Defaults()
+	cfg.CI.Timeout = "5s"
+	cfg.CI.PollInterval = "1s"
+	cfg.Commands.Test = "true"
+	cfg.Commands.Lint = "true"
+	cfg.Docs.Enabled = false
+	state := runstate.New(repo, "feature/source", "main", "origin", "abc", "origin/main")
+	state.WorktreePath = repo
+	state.ReviewBranch = "nml/test"
+	state.PRURL = "https://github.com/owner/repo/pull/1"
+	state.Intent = "add feature file"
+	var errw bytes.Buffer
+	app := App{Err: &errw, Cwd: repo, Interactive: false}
+	if err := app.runCIWatch(context.Background(), cfg, runOptions{}, &state, fakeGH); err != nil {
+		t.Fatalf("runCIWatch returned error: %v\nstderr:\n%s", err, errw.String())
+	}
+	if got := appTestStepStatus(state, "ci"); got != runstate.StatusCompleted {
+		t.Fatalf("ci status = %s, want completed", got)
+	}
+	if _, err := (gitx.Client{Dir: repo}).Run(context.Background(), "merge-base", "--is-ancestor", "origin/main", "HEAD"); err != nil {
+		t.Fatalf("review branch was not rebased onto origin/main: %v", err)
+	}
+	logData, err := os.ReadFile(ghLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(logData), "pr checks") {
+		t.Fatalf("expected CI checks to be watched after conflict resolution, gh log:\n%s", logData)
 	}
 }
 
