@@ -80,6 +80,7 @@ Persist run defaults globally or for the current project. Project settings overr
 
 ```sh
 nml config --interactive
+nml config --scope global --set agent.name=codex
 nml config --scope project --set review.yolo=true --set ci.timeout=15m
 nml config --scope project --set review.auto_approve_after_rounds=true
 nml config --scope project --set auto_merge.enabled=true --set auto_merge.method=squash
@@ -89,7 +90,7 @@ nml config --scope global --set review.yolo=false --set ci.timeout=30m
 nml config --format toon
 ```
 
-`nml config --interactive` starts with a scope picker, then prompts for yolo review fixing, auto-approve after review rounds, auto-merge, auto-merge method, PR conflict repair mode, auto-cleanup, CI timeout, test command, and lint command. Supported non-interactive keys are `review.yolo`, `review.auto_approve_after_rounds`, `auto_merge.enabled`, `auto_merge.method`, `conflict_resolution.mode`, `cleanup.auto`, `ci.timeout`, `commands.test`, and `commands.lint`. CLI flags still override persisted defaults for that invocation.
+`nml config --interactive` starts with a scope picker, then prompts for coding agent, yolo review fixing, auto-approve after review rounds, auto-merge, auto-merge method, PR conflict repair mode, auto-cleanup, CI timeout, test command, and lint command. Supported non-interactive keys are `agent.name`, `review.yolo`, `review.auto_approve_after_rounds`, `auto_merge.enabled`, `auto_merge.method`, `conflict_resolution.mode`, `cleanup.auto`, `ci.timeout`, `commands.test`, and `commands.lint`. CLI flags still override persisted defaults for that invocation.
 
 ## Agent integrations
 

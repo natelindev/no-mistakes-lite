@@ -143,7 +143,7 @@ func TestConfigSetPersistsProjectSettings(t *testing.T) {
 	repo := newAppTestRepo(t, filepath.Join(t.TempDir(), "repo"))
 	var out, errw bytes.Buffer
 	app := App{Out: &out, Err: &errw, Cwd: repo, Interactive: false}
-	code := app.Run(context.Background(), []string{"config", "--scope", "project", "--set", "review.yolo=true", "--set", "ci.timeout=15m", "--set", "auto_merge.enabled=true"})
+	code := app.Run(context.Background(), []string{"config", "--scope", "project", "--set", "agent.name=codex", "--set", "review.yolo=true", "--set", "ci.timeout=15m", "--set", "auto_merge.enabled=true"})
 	if code != ExitOK {
 		t.Fatalf("expected exit 0, got %d\nstdout:\n%s\nstderr:\n%s", code, out.String(), errw.String())
 	}
@@ -153,10 +153,25 @@ func TestConfigSetPersistsProjectSettings(t *testing.T) {
 		t.Fatalf("expected config exit 0, got %d", code)
 	}
 	text := out.String()
-	for _, want := range []string{"review.yolo,\"true\"", "ci.timeout,15m", "auto_merge.enabled,\"true\""} {
+	for _, want := range []string{"agent,codex", "review.yolo,\"true\"", "ci.timeout,15m", "auto_merge.enabled,\"true\""} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("config output missing %q in:\n%s", want, text)
 		}
+	}
+}
+
+func TestConfigSetRejectsUnsupportedAgent(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	repo := newAppTestRepo(t, filepath.Join(t.TempDir(), "repo"))
+	var out, errw bytes.Buffer
+	app := App{Out: &out, Err: &errw, Cwd: repo, Interactive: false}
+	code := app.Run(context.Background(), []string{"config", "--scope", "project", "--set", "agent.name=vim"})
+	if code != ExitError {
+		t.Fatalf("expected exit %d, got %d\nstdout:\n%s\nstderr:\n%s", ExitError, code, out.String(), errw.String())
+	}
+	if !strings.Contains(out.String(), "agent.name must be pi, opencode, codex, or claude") {
+		t.Fatalf("unexpected output: %q", out.String())
 	}
 }
 

@@ -19,6 +19,8 @@ const (
 	AppName = "nml"
 )
 
+var SupportedAgentNames = []string{"pi", "opencode", "codex", "claude"}
+
 type AgentConfig struct {
 	Name          string            `yaml:"name" json:"name"`
 	Model         string            `yaml:"model" json:"model"`
@@ -469,6 +471,11 @@ func parseSetting(key, value string) (any, string, error) {
 	key = strings.TrimSpace(key)
 	value = strings.TrimSpace(value)
 	switch key {
+	case "agent", "agent.name":
+		if !ValidAgentName(value) {
+			return nil, "", fmt.Errorf("agent.name must be pi, opencode, codex, or claude")
+		}
+		return value, "agent.name", nil
 	case "yolo", "review.yolo":
 		parsed, err := strconv.ParseBool(value)
 		if err != nil {
@@ -516,6 +523,16 @@ func parseSetting(key, value string) (any, string, error) {
 	default:
 		return nil, "", fmt.Errorf("unsupported setting %q", key)
 	}
+}
+
+func ValidAgentName(name string) bool {
+	name = strings.TrimSpace(name)
+	for _, supported := range SupportedAgentNames {
+		if name == supported {
+			return true
+		}
+	}
+	return false
 }
 
 func setDotted(doc map[string]any, key string, value any) {

@@ -2934,6 +2934,10 @@ func (a App) configInteractive(ctx context.Context, repoRoot string) int {
 		toon.Error(a.Out, err.Error(), nil)
 		return ExitError
 	}
+	agentName, cancelled := a.chooseConfigAgent(ctx, cfg)
+	if cancelled {
+		return a.setupCancelled()
+	}
 	yolo, cancelled := a.promptChoice(ctx, "Yolo mode (auto-fix review findings)", fmt.Sprint(cfg.Review.Yolo), []string{"false", "true"})
 	if cancelled {
 		return a.setupCancelled()
@@ -2971,6 +2975,7 @@ func (a App) configInteractive(ctx context.Context, repoRoot string) int {
 		return a.setupCancelled()
 	}
 	settings := map[string]string{
+		"agent.name":                       agentName,
 		"review.yolo":                      yolo,
 		"review.auto_approve_after_rounds": autoApproveAfterRounds,
 		"auto_merge.enabled":               autoMerge,
@@ -2990,6 +2995,7 @@ func (a App) configInteractive(ctx context.Context, repoRoot string) int {
 	toon.KV(a.Out, "scope", scope)
 	toon.KV(a.Out, "path", path)
 	toon.Table(a.Out, "settings", []string{"key", "value"}, []toon.Row{
+		{"agent.name", agentName},
 		{"review.yolo", yolo},
 		{"review.auto_approve_after_rounds", autoApproveAfterRounds},
 		{"auto_merge.enabled", autoMerge},
@@ -4319,12 +4325,7 @@ func exists(path string) bool {
 }
 
 func supportedAgent(name string) bool {
-	for _, supported := range agent.Supported {
-		if name == supported {
-			return true
-		}
-	}
-	return false
+	return config.ValidAgentName(name)
 }
 
 func (a App) chooseAgent(ctx context.Context, found []agent.Found) (string, bool) {
@@ -4347,6 +4348,47 @@ func (a App) chooseAgent(ctx context.Context, found []agent.Found) (string, bool
 		return "", true
 	}
 	return found[idx].Name, false
+}
+
+func (a App) chooseConfigAgent(ctx context.Context, cfg config.Config) (string, bool) {
+	if !a.Interactive {
+		return cfg.Agent.Name, false
+	}
+	detected := map[string]string{}
+	for _, found := range agent.Detect(cfg.Agent.PathOverrides) {
+		detected[found.Name] = found.Path
+	}
+	options := make([]tui.Option, 0, len(agent.Supported))
+	initial := 0
+	firstDetected := -1
+	for i, name := range agent.Supported {
+		description := "not detected on PATH"
+		if path := detected[name]; path != "" {
+			description = path
+			if firstDetected == -1 {
+				firstDetected = i
+			}
+		}
+		if name == cfg.Agent.Name {
+			initial = i
+		}
+		options = append(options, tui.Option{Label: name, Description: description})
+	}
+	if !config.ValidAgentName(cfg.Agent.Name) && firstDetected >= 0 {
+		initial = firstDetected
+	}
+	idx, cancelled, err := tui.SelectOne(ctx, a.In, a.Err, "Coding agent", options, initial)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", true
+		}
+		fmt.Fprintf(a.Err, "nml: agent picker failed: %v\n", err)
+		return "", true
+	}
+	if cancelled || idx < 0 || idx >= len(agent.Supported) {
+		return "", true
+	}
+	return agent.Supported[idx], false
 }
 
 func (a App) promptWizard(ctx context.Context, label, def string) (string, bool) {
@@ -4632,6 +4674,7 @@ func printConfigHelp(w io.Writer) {
 	fmt.Fprintln(w, "  --set <KEY=VALUE>          persist setting; repeat for multiple settings")
 	fmt.Fprintln(w, "  --set-test-command <cmd>   save a per-repo test command (default: none)")
 	fmt.Fprintln(w, "Settings:")
+	fmt.Fprintln(w, "  agent.name=pi|opencode|codex|claude")
 	fmt.Fprintln(w, "  review.yolo=true|false")
 	fmt.Fprintln(w, "  review.auto_approve_after_rounds=true|false")
 	fmt.Fprintln(w, "  auto_merge.enabled=true|false")
@@ -4644,6 +4687,7 @@ func printConfigHelp(w io.Writer) {
 	fmt.Fprintln(w, "Examples:")
 	fmt.Fprintln(w, "  nml config --format toon")
 	fmt.Fprintln(w, "  nml config --interactive")
+	fmt.Fprintln(w, "  nml config --scope global --set agent.name=codex")
 	fmt.Fprintln(w, "  nml config --scope project --set review.yolo=true --set ci.timeout=15m")
 	fmt.Fprintln(w, "  nml config --scope project --set review.auto_approve_after_rounds=true")
 	fmt.Fprintln(w, "  nml config --scope global --set auto_merge.enabled=true")

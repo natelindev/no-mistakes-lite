@@ -34,6 +34,7 @@ nml findings --run <id> --full
 nml runs --resumable
 nml resume --run <id>
 nml config --interactive
+nml config --scope global --set agent.name=codex
 nml config --scope project --set review.yolo=true --set ci.timeout=15m
 nml config --scope project --set review.auto_approve_after_rounds=true
 nml config --scope global --set auto_merge.enabled=true
@@ -52,7 +53,7 @@ Common run flags:
 - `nml` checks PR merge state before and after CI watches. If GitHub reports merge conflicts, nml repairs the review branch with `conflict_resolution.mode` (`merge` by default, or `rebase`), asks the configured agent to resolve local conflicts when needed, re-runs validation, force-pushes, and watches checks again.
 - Runs with `--yolo`, explicit review skips, or auto-approved unresolved review findings require reported CI checks; nml waits briefly for checks to register before failing if none appear after any detected PR merge conflicts are repaired.
 - `--skip-docs`, `--skip-deploy`, `--ci-timeout <duration>`, `--merge-method <squash|merge|rebase>`, and `--fetch <bool>` tune the run.
-- Persist defaults with `nml config --interactive`, `nml config --scope project --set review.yolo=true --set ci.timeout=15m`, `nml config --scope project --set review.auto_approve_after_rounds=true`, `nml config --scope project --set conflict_resolution.mode=rebase`, or `nml config --scope global --set auto_merge.enabled=true`. Project settings override global settings.
+- Persist defaults with `nml config --interactive`, `nml config --scope global --set agent.name=codex`, `nml config --scope project --set review.yolo=true --set ci.timeout=15m`, `nml config --scope project --set review.auto_approve_after_rounds=true`, `nml config --scope project --set conflict_resolution.mode=rebase`, or `nml config --scope global --set auto_merge.enabled=true`. Project settings override global settings.
 
 ## Review gates
 

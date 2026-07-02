@@ -164,6 +164,7 @@ func TestSaveScopedSettingsSupportsGlobalAndProject(t *testing.T) {
 	repoA := newConfigTestRepo(t, "a")
 	repoB := newConfigTestRepo(t, "b")
 	if _, err := SaveScopedSettings("", "global", map[string]string{
+		"agent.name":                       "codex",
 		"review.yolo":                      "true",
 		"review.auto_approve_after_rounds": "true",
 		"auto_merge.enabled":               "true",
@@ -184,7 +185,7 @@ func TestSaveScopedSettingsSupportsGlobalAndProject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfgA.Review.Yolo || !cfgA.Review.AutoApproveAfterRounds || cfgA.CI.Timeout != "15m" || cfgA.ConflictResolution.Mode != "rebase" {
+	if cfgA.Agent.Name != "codex" || !cfgA.Review.Yolo || !cfgA.Review.AutoApproveAfterRounds || cfgA.CI.Timeout != "15m" || cfgA.ConflictResolution.Mode != "rebase" {
 		t.Fatalf("repo A did not inherit global settings: %#v", cfgA)
 	}
 	if cfgA.AutoMerge.Enabled {
@@ -195,5 +196,13 @@ func TestSaveScopedSettingsSupportsGlobalAndProject(t *testing.T) {
 	}
 	if cfgB.Cleanup.Auto {
 		t.Fatal("repo B should inherit global cleanup.auto false")
+	}
+}
+
+func TestSaveScopedSettingsRejectsUnsupportedAgent(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if _, err := SaveScopedSettings("", "global", map[string]string{"agent.name": "vim"}); err == nil {
+		t.Fatal("expected unsupported agent error")
 	}
 }

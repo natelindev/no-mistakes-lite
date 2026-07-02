@@ -36,6 +36,7 @@ nml respond --action fix --run <id>      # fix all latest review findings
 nml respond --action approve
 nml config --format toon
 nml config --interactive
+nml config --scope global --set agent.name=codex
 nml config --scope project --set review.yolo=true --set ci.timeout=15m
 nml config --scope project --set review.auto_approve_after_rounds=true
 nml config --scope global --set auto_merge.enabled=true

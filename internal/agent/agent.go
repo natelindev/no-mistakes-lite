@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"github.com/natelindev/no-mistakes-lite/internal/config"
 )
 
-var Supported = []string{"pi", "opencode", "codex", "claude"}
+var Supported = config.SupportedAgentNames
 
 type Found struct {
 	Name string `json:"name"`
