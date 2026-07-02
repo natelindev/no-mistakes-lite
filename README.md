@@ -39,6 +39,7 @@ nml config --interactive
 nml config --scope project --set review.yolo=true --set ci.timeout=15m
 nml config --scope project --set review.auto_approve_after_rounds=true
 nml config --scope global --set auto_merge.enabled=true
+nml config --scope project --set conflict_resolution.mode=rebase
 nml config --scope project --set cleanup.auto=false
 nml hooks install --apps claude,codex,opencode
 nml tui                                 # timeline, or interactive review gate
@@ -60,7 +61,7 @@ The repository also carries an Agent Skill at `skills/no-mistakes-lite/SKILL.md`
 ## Implemented first
 
 - Go module and `nml` binary skeleton.
-- Global and per-repo config loading from `~/.config/nml`, including persistent run defaults such as yolo review fixing, auto-approve after review rounds, auto-merge, auto-cleanup, CI timeout, and validation commands.
+- Global and per-repo config loading from `~/.config/nml`, including persistent run defaults such as yolo review fixing, auto-approve after review rounds, PR conflict repair mode, auto-merge, auto-cleanup, CI timeout, and validation commands.
 - Git preflight classification and no-op exits.
 - Non-interactive first-run setup with `--yes`, plus an explicit `--interactive` wizard for humans.
 - Doctor command with TOON output.
@@ -71,7 +72,7 @@ The repository also carries an Agent Skill at `skills/no-mistakes-lite/SKILL.md`
 - Test command execution only when configured per repo or supplied per run, plus lint command execution with skip reasons and agent fix retries.
 - Docs evaluation and optional agent documentation updates.
 - GitHub remote detection, safe push of tool-owned `nml/*` branches, and GitHub PR create/update through `gh` when available.
-- Bounded CI watch with delayed check registration handling, PR merge-conflict detection and review-branch rebase, failed-log collection, persisted CI logs, stricter no-checks handling for yolo, skipped-review, or unresolved-finding auto-approved runs, agent CI fix retries, optional per-run auto-merge with GitHub CLI prompts disabled, and optional deploy command retries.
+- Bounded CI watch with delayed check registration handling, PR merge-conflict detection and configurable merge or rebase repair, failed-log collection, persisted CI logs, stricter no-checks handling for yolo, skipped-review, or unresolved-finding auto-approved runs, agent CI fix retries, optional per-run auto-merge with GitHub CLI prompts disabled, and optional deploy command retries.
 - Resumable failed or interrupted runs via `nml resume`, review finding parser, secret redaction, PR body generation, Bubble Tea run timeline and interactive review gate response picker, AXI session hook installation for Claude Code, Codex, and OpenCode, installable Agent Skill, binary-only install script, usage docs, and unit tests.
 
 See `docs/usage.md` for workflow details. Future work is mostly provider expansion.

@@ -38,7 +38,7 @@ preflight -> intent -> commit -> worktree -> review -> test -> docs -> lint -> p
 - Set `review.auto_approve_after_rounds=true` to continue after the configured review rounds even when auto-fix attempts still leave findings.
 - Pass `--skip-review` to mark the review step skipped without invoking the configured agent or built-in review checks.
 - Tests, docs, lint, CI, and deploy can ask the configured agent for fixes. PR bodies summarize only each command and final status, not full command output.
-- Before waiting on CI, nml checks the PR merge state. If GitHub reports merge conflicts, nml rebases the review branch onto the current base, asks the configured agent to resolve local rebase conflicts when needed, re-runs validation, force-pushes, and then watches checks again.
+- Before waiting on CI, nml checks the PR merge state. If GitHub reports merge conflicts, nml repairs the review branch with `conflict_resolution.mode` (`merge` by default, or `rebase`), asks the configured agent to resolve local conflicts when needed, re-runs validation, force-pushes, and then watches checks again.
 - If GitHub initially reports no PR checks, nml waits briefly for checks to register before deciding there are no checks. Runs that use `--yolo`, explicitly skip review, or auto-approve unresolved review findings require reported CI checks and fail if none appear.
 - Completed runs print a compact summary with PR URL, cleanup status, and step statuses. Use `nml status --run <id>` or `nml status --run <id> --full` for step details and logs.
 - Auto-merge means nml runs `gh pr merge` after checks pass. It does not use GitHub's repository-level auto-merge feature. GitHub CLI prompts are disabled, so nml fails with saved state instead of waiting for terminal input.
@@ -83,12 +83,13 @@ nml config --interactive
 nml config --scope project --set review.yolo=true --set ci.timeout=15m
 nml config --scope project --set review.auto_approve_after_rounds=true
 nml config --scope project --set auto_merge.enabled=true --set auto_merge.method=squash
+nml config --scope project --set conflict_resolution.mode=rebase
 nml config --scope project --set cleanup.auto=false
 nml config --scope global --set review.yolo=false --set ci.timeout=30m
 nml config --format toon
 ```
 
-`nml config --interactive` starts with a scope picker, then prompts for yolo review fixing, auto-approve after review rounds, auto-merge, merge method, auto-cleanup, CI timeout, test command, and lint command. Supported non-interactive keys are `review.yolo`, `review.auto_approve_after_rounds`, `auto_merge.enabled`, `auto_merge.method`, `cleanup.auto`, `ci.timeout`, `commands.test`, and `commands.lint`. CLI flags still override persisted defaults for that invocation.
+`nml config --interactive` starts with a scope picker, then prompts for yolo review fixing, auto-approve after review rounds, auto-merge, auto-merge method, PR conflict repair mode, auto-cleanup, CI timeout, test command, and lint command. Supported non-interactive keys are `review.yolo`, `review.auto_approve_after_rounds`, `auto_merge.enabled`, `auto_merge.method`, `conflict_resolution.mode`, `cleanup.auto`, `ci.timeout`, `commands.test`, and `commands.lint`. CLI flags still override persisted defaults for that invocation.
 
 ## Agent integrations
 

@@ -49,6 +49,10 @@ type CIConfig struct {
 	PollInterval string `yaml:"poll_interval" json:"poll_interval"`
 }
 
+type ConflictResolutionConfig struct {
+	Mode string `yaml:"mode" json:"mode"`
+}
+
 type AutoMergeConfig struct {
 	Enabled bool   `yaml:"enabled" json:"enabled"`
 	Method  string `yaml:"method" json:"method"`
@@ -70,17 +74,18 @@ type CleanupConfig struct {
 }
 
 type Config struct {
-	Agent      AgentConfig     `yaml:"agent" json:"agent"`
-	MainBranch string          `yaml:"main_branch" json:"main_branch"`
-	Remote     string          `yaml:"remote" json:"remote"`
-	Commands   CommandsConfig  `yaml:"commands" json:"commands"`
-	Commit     CommitConfig    `yaml:"commit" json:"commit"`
-	Review     ReviewConfig    `yaml:"review" json:"review"`
-	CI         CIConfig        `yaml:"ci" json:"ci"`
-	AutoMerge  AutoMergeConfig `yaml:"auto_merge" json:"auto_merge"`
-	Docs       DocsConfig      `yaml:"docs" json:"docs"`
-	Deploy     DeployConfig    `yaml:"deploy" json:"deploy"`
-	Cleanup    CleanupConfig   `yaml:"cleanup" json:"cleanup"`
+	Agent              AgentConfig              `yaml:"agent" json:"agent"`
+	MainBranch         string                   `yaml:"main_branch" json:"main_branch"`
+	Remote             string                   `yaml:"remote" json:"remote"`
+	Commands           CommandsConfig           `yaml:"commands" json:"commands"`
+	Commit             CommitConfig             `yaml:"commit" json:"commit"`
+	Review             ReviewConfig             `yaml:"review" json:"review"`
+	CI                 CIConfig                 `yaml:"ci" json:"ci"`
+	ConflictResolution ConflictResolutionConfig `yaml:"conflict_resolution" json:"conflict_resolution"`
+	AutoMerge          AutoMergeConfig          `yaml:"auto_merge" json:"auto_merge"`
+	Docs               DocsConfig               `yaml:"docs" json:"docs"`
+	Deploy             DeployConfig             `yaml:"deploy" json:"deploy"`
+	Cleanup            CleanupConfig            `yaml:"cleanup" json:"cleanup"`
 }
 
 type Paths struct {
@@ -117,26 +122,28 @@ func Defaults() Config {
 			Timeout:      "30m",
 			PollInterval: "20s",
 		},
-		AutoMerge: AutoMergeConfig{Method: "squash"},
-		Docs:      DocsConfig{Enabled: true},
-		Deploy:    DeployConfig{Enabled: false, When: "after_ci"},
-		Cleanup:   CleanupConfig{Auto: true},
+		ConflictResolution: ConflictResolutionConfig{Mode: "merge"},
+		AutoMerge:          AutoMergeConfig{Method: "squash"},
+		Docs:               DocsConfig{Enabled: true},
+		Deploy:             DeployConfig{Enabled: false, When: "after_ci"},
+		Cleanup:            CleanupConfig{Auto: true},
 	}
 }
 
 // RawConfig uses pointers so local config can intentionally set false or zero values.
 type RawConfig struct {
-	Agent      *RawAgentConfig     `yaml:"agent"`
-	MainBranch *string             `yaml:"main_branch"`
-	Remote     *string             `yaml:"remote"`
-	Commands   *RawCommandsConfig  `yaml:"commands"`
-	Commit     *RawCommitConfig    `yaml:"commit"`
-	Review     *RawReviewConfig    `yaml:"review"`
-	CI         *RawCIConfig        `yaml:"ci"`
-	AutoMerge  *RawAutoMergeConfig `yaml:"auto_merge"`
-	Docs       *RawDocsConfig      `yaml:"docs"`
-	Deploy     *RawDeployConfig    `yaml:"deploy"`
-	Cleanup    *RawCleanupConfig   `yaml:"cleanup"`
+	Agent              *RawAgentConfig              `yaml:"agent"`
+	MainBranch         *string                      `yaml:"main_branch"`
+	Remote             *string                      `yaml:"remote"`
+	Commands           *RawCommandsConfig           `yaml:"commands"`
+	Commit             *RawCommitConfig             `yaml:"commit"`
+	Review             *RawReviewConfig             `yaml:"review"`
+	CI                 *RawCIConfig                 `yaml:"ci"`
+	ConflictResolution *RawConflictResolutionConfig `yaml:"conflict_resolution"`
+	AutoMerge          *RawAutoMergeConfig          `yaml:"auto_merge"`
+	Docs               *RawDocsConfig               `yaml:"docs"`
+	Deploy             *RawDeployConfig             `yaml:"deploy"`
+	Cleanup            *RawCleanupConfig            `yaml:"cleanup"`
 }
 
 type RawAgentConfig struct {
@@ -167,6 +174,10 @@ type RawReviewConfig struct {
 type RawCIConfig struct {
 	Timeout      *string `yaml:"timeout"`
 	PollInterval *string `yaml:"poll_interval"`
+}
+
+type RawConflictResolutionConfig struct {
+	Mode *string `yaml:"mode"`
 }
 
 type RawAutoMergeConfig struct {
@@ -357,6 +368,11 @@ func Apply(cfg *Config, raw RawConfig) {
 			cfg.CI.PollInterval = *raw.CI.PollInterval
 		}
 	}
+	if raw.ConflictResolution != nil {
+		if raw.ConflictResolution.Mode != nil {
+			cfg.ConflictResolution.Mode = *raw.ConflictResolution.Mode
+		}
+	}
 	if raw.AutoMerge != nil {
 		if raw.AutoMerge.Enabled != nil {
 			cfg.AutoMerge.Enabled = *raw.AutoMerge.Enabled
@@ -482,6 +498,12 @@ func parseSetting(key, value string) (any, string, error) {
 			return nil, "", fmt.Errorf("%s must be true or false", key)
 		}
 		return parsed, "cleanup.auto", nil
+	case "conflict_resolution.mode":
+		mode := strings.TrimSpace(value)
+		if !ValidConflictResolutionMode(mode) {
+			return nil, "", fmt.Errorf("conflict_resolution.mode must be merge or rebase")
+		}
+		return mode, "conflict_resolution.mode", nil
 	case "ci.timeout":
 		if _, err := time.ParseDuration(value); err != nil {
 			return nil, "", fmt.Errorf("ci.timeout must be a duration like 15m: %w", err)
@@ -517,6 +539,23 @@ func MarshalYAML(cfg Config) ([]byte, error) {
 func ValidMergeMethod(method string) bool {
 	switch method {
 	case "squash", "merge", "rebase":
+		return true
+	default:
+		return false
+	}
+}
+
+func NormalizeConflictResolutionMode(mode string) string {
+	mode = strings.TrimSpace(mode)
+	if mode == "" {
+		return "merge"
+	}
+	return mode
+}
+
+func ValidConflictResolutionMode(mode string) bool {
+	switch mode {
+	case "merge", "rebase":
 		return true
 	default:
 		return false

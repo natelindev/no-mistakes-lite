@@ -483,7 +483,7 @@ func TestPRMergeConflictDetailDetectsDirtyState(t *testing.T) {
 	}
 }
 
-func TestRunCIWatchRebasesPRMergeConflictBeforeWatchingChecks(t *testing.T) {
+func TestRunCIWatchMergesPRMergeConflictByDefaultBeforeWatchingChecks(t *testing.T) {
 	root := t.TempDir()
 	home := filepath.Join(root, "home")
 	t.Setenv("HOME", home)
@@ -564,7 +564,11 @@ esac
 		t.Fatalf("ci status = %s, want completed", got)
 	}
 	if _, err := (gitx.Client{Dir: repo}).Run(context.Background(), "merge-base", "--is-ancestor", "origin/main", "HEAD"); err != nil {
-		t.Fatalf("review branch was not rebased onto origin/main: %v", err)
+		t.Fatalf("review branch did not include origin/main after conflict repair: %v", err)
+	}
+	parents := strings.Fields(strings.TrimSpace(runGitAppTestOutput(t, repo, "rev-list", "--parents", "-n", "1", "HEAD")))
+	if len(parents) != 3 {
+		t.Fatalf("default conflict repair should create a merge commit, rev-list --parents fields: %v", parents)
 	}
 	logData, err := os.ReadFile(ghLog)
 	if err != nil {
@@ -572,6 +576,55 @@ esac
 	}
 	if !strings.Contains(string(logData), "pr checks") {
 		t.Fatalf("expected CI checks to be watched after conflict resolution, gh log:\n%s", logData)
+	}
+}
+
+func TestResolvePRMergeConflictCanRebaseWhenConfigured(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	t.Setenv("HOME", home)
+	repo := newAppTestRepo(t, filepath.Join(root, "repo"))
+	bareRemote := filepath.Join(root, "remote.git")
+	runGitAppTest(t, root, "init", "--bare", bareRemote)
+	runGitAppTest(t, repo, "remote", "add", "origin", bareRemote)
+	runGitAppTest(t, repo, "push", "origin", "main")
+	runGitAppTest(t, repo, "checkout", "-b", "nml/test")
+	if err := os.WriteFile(filepath.Join(repo, "feature.txt"), []byte("feature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAppTest(t, repo, "add", "feature.txt")
+	runGitAppTest(t, repo, "commit", "-m", "feat: add feature")
+	runGitAppTest(t, repo, "push", "origin", "nml/test")
+	runGitAppTest(t, repo, "checkout", "main")
+	if err := os.WriteFile(filepath.Join(repo, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAppTest(t, repo, "add", "base.txt")
+	runGitAppTest(t, repo, "commit", "-m", "feat: advance base")
+	runGitAppTest(t, repo, "push", "origin", "main")
+	runGitAppTest(t, repo, "checkout", "nml/test")
+
+	cfg := config.Defaults()
+	cfg.ConflictResolution.Mode = "rebase"
+	cfg.Commands.Test = "true"
+	cfg.Commands.Lint = "true"
+	cfg.Docs.Enabled = false
+	state := runstate.New(repo, "feature/source", "main", "origin", "abc", "origin/main")
+	state.WorktreePath = repo
+	state.ReviewBranch = "nml/test"
+	state.PRURL = "https://github.com/owner/repo/pull/1"
+	state.Intent = "add feature file"
+	var errw bytes.Buffer
+	app := App{Err: &errw, Cwd: repo, Interactive: false}
+	if err := app.resolvePRMergeConflict(context.Background(), cfg, runOptions{}, &state, "PR has merge conflicts"); err != nil {
+		t.Fatalf("resolvePRMergeConflict returned error: %v\nstderr:\n%s", err, errw.String())
+	}
+	if _, err := (gitx.Client{Dir: repo}).Run(context.Background(), "merge-base", "--is-ancestor", "origin/main", "HEAD"); err != nil {
+		t.Fatalf("review branch did not include origin/main after rebase repair: %v", err)
+	}
+	parents := strings.Fields(strings.TrimSpace(runGitAppTestOutput(t, repo, "rev-list", "--parents", "-n", "1", "HEAD")))
+	if len(parents) != 2 {
+		t.Fatalf("rebase conflict repair should keep a linear head commit, rev-list --parents fields: %v", parents)
 	}
 }
 

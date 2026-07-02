@@ -33,6 +33,9 @@ func TestDefaults(t *testing.T) {
 	if cfg.AutoMerge.Method != "squash" {
 		t.Fatalf("unexpected merge method: %s", cfg.AutoMerge.Method)
 	}
+	if cfg.ConflictResolution.Mode != "merge" {
+		t.Fatalf("unexpected conflict resolution mode: %s", cfg.ConflictResolution.Mode)
+	}
 	if !cfg.Cleanup.Auto {
 		t.Fatal("cleanup.auto should default true")
 	}
@@ -108,9 +111,11 @@ func TestApplyCanOverridePersistentRunSettings(t *testing.T) {
 	cfg := Defaults()
 	trueValue := true
 	method := "rebase"
+	conflictMode := "rebase"
 	Apply(&cfg, RawConfig{
-		Review:    &RawReviewConfig{Yolo: &trueValue, AutoApproveAfterRounds: &trueValue},
-		AutoMerge: &RawAutoMergeConfig{Enabled: &trueValue, Method: &method},
+		Review:             &RawReviewConfig{Yolo: &trueValue, AutoApproveAfterRounds: &trueValue},
+		AutoMerge:          &RawAutoMergeConfig{Enabled: &trueValue, Method: &method},
+		ConflictResolution: &RawConflictResolutionConfig{Mode: &conflictMode},
 	})
 	if !cfg.Review.Yolo {
 		t.Fatal("expected review.yolo true override")
@@ -123,6 +128,9 @@ func TestApplyCanOverridePersistentRunSettings(t *testing.T) {
 	}
 	if cfg.AutoMerge.Method != "rebase" {
 		t.Fatalf("auto merge method = %q", cfg.AutoMerge.Method)
+	}
+	if cfg.ConflictResolution.Mode != "rebase" {
+		t.Fatalf("conflict resolution mode = %q", cfg.ConflictResolution.Mode)
 	}
 }
 
@@ -159,6 +167,7 @@ func TestSaveScopedSettingsSupportsGlobalAndProject(t *testing.T) {
 		"review.yolo":                      "true",
 		"review.auto_approve_after_rounds": "true",
 		"auto_merge.enabled":               "true",
+		"conflict_resolution.mode":         "rebase",
 		"cleanup.auto":                     "false",
 		"ci.timeout":                       "15m",
 	}); err != nil {
@@ -175,7 +184,7 @@ func TestSaveScopedSettingsSupportsGlobalAndProject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfgA.Review.Yolo || !cfgA.Review.AutoApproveAfterRounds || cfgA.CI.Timeout != "15m" {
+	if !cfgA.Review.Yolo || !cfgA.Review.AutoApproveAfterRounds || cfgA.CI.Timeout != "15m" || cfgA.ConflictResolution.Mode != "rebase" {
 		t.Fatalf("repo A did not inherit global settings: %#v", cfgA)
 	}
 	if cfgA.AutoMerge.Enabled {

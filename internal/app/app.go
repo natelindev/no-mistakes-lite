@@ -1680,8 +1680,20 @@ func prMergeConflictDetail(state prMergeState) (string, bool) {
 
 func (a App) resolvePRMergeConflict(ctx context.Context, cfg config.Config, opts runOptions, run *runstate.State, detail string) error {
 	_, _ = session.WriteLog(*run, "pr-merge-conflict.log", redact.Secrets(detail))
-	run.SetStep("ci", runstate.StatusFixing, detail+"; rebasing review branch onto "+run.BaseRef)
-	if err := a.rebaseReviewBranchOntoBase(ctx, cfg, run, detail); err != nil {
+	mode := config.NormalizeConflictResolutionMode(cfg.ConflictResolution.Mode)
+	if !config.ValidConflictResolutionMode(mode) {
+		return fmt.Errorf("conflict_resolution.mode must be merge or rebase")
+	}
+	var err error
+	switch mode {
+	case "merge":
+		run.SetStep("ci", runstate.StatusFixing, detail+"; merging "+run.BaseRef+" into review branch")
+		err = a.mergeBaseIntoReviewBranch(ctx, cfg, run, detail)
+	case "rebase":
+		run.SetStep("ci", runstate.StatusFixing, detail+"; rebasing review branch onto "+run.BaseRef)
+		err = a.rebaseReviewBranchOntoBase(ctx, cfg, run, detail)
+	}
+	if err != nil {
 		return err
 	}
 	if err := a.runValidationCommands(ctx, cfg, opts, run); err != nil {
@@ -1696,6 +1708,122 @@ func (a App) resolvePRMergeConflict(ctx context.Context, cfg config.Config, opts
 	run.SetStep("push", runstate.StatusCompleted, "pushed PR merge conflict fix to "+run.Remote)
 	run.SetStep("ci", runstate.StatusRunning, "PR merge conflict resolved; waiting for checks")
 	return nil
+}
+
+func (a App) mergeBaseIntoReviewBranch(ctx context.Context, cfg config.Config, run *runstate.State, conflictDetail string) error {
+	client := gitx.Client{Dir: run.WorktreePath}
+	if strings.TrimSpace(run.BaseRef) == "" {
+		return fmt.Errorf("run state is missing base ref for PR merge conflict resolution")
+	}
+	if strings.TrimSpace(run.ReviewBranch) != "" {
+		if _, err := client.Run(ctx, "checkout", run.ReviewBranch); err != nil {
+			return fmt.Errorf("checkout review branch %s: %w", run.ReviewBranch, err)
+		}
+	}
+	status, err := client.StatusPorcelain(ctx)
+	if err != nil {
+		return err
+	}
+	if gitx.IsDirty(status) {
+		return fmt.Errorf("worktree is dirty before PR merge conflict resolution: %s", truncate(strings.TrimSpace(status), 1000))
+	}
+	if err := a.withSpinner(ctx, "fetching base branch before conflict resolution", func() error {
+		return client.Fetch(ctx, run.Remote, run.MainBranch)
+	}); err != nil {
+		return fmt.Errorf("fetch base branch before conflict resolution: %w", err)
+	}
+	if !client.RefExists(ctx, run.BaseRef) {
+		return fmt.Errorf("base ref %s is not available after fetch", run.BaseRef)
+	}
+	out, err := a.withSpinnerOutput(ctx, "merging "+run.BaseRef+" into review branch", func() (string, error) {
+		return client.Run(ctx, "-c", "core.editor=true", "merge", "--no-edit", run.BaseRef)
+	})
+	_, _ = session.WriteLog(*run, "pr-merge-conflict-merge.log", redact.Secrets(out))
+	if err == nil {
+		return ensureCleanMergeWorktree(ctx, client)
+	}
+	if cfg.Agent.Name == "" {
+		_, _ = client.Run(ctx, "merge", "--abort")
+		return fmt.Errorf("%s; local merge failed and no agent is configured to resolve conflicts: %s", conflictDetail, redact.Secrets(commandDetail("git merge "+run.BaseRef, out)))
+	}
+	if fixErr := a.fixMergeConflicts(ctx, cfg, run, conflictDetail, out); fixErr != nil {
+		_, _ = client.Run(ctx, "merge", "--abort")
+		return fixErr
+	}
+	return ensureCleanMergeWorktree(ctx, client)
+}
+
+func ensureCleanMergeWorktree(ctx context.Context, client gitx.Client) error {
+	status, err := client.StatusPorcelain(ctx)
+	if err != nil {
+		return err
+	}
+	if gitx.IsDirty(status) {
+		return fmt.Errorf("merge finished with uncommitted changes: %s", truncate(strings.TrimSpace(status), 1000))
+	}
+	return nil
+}
+
+func (a App) fixMergeConflicts(ctx context.Context, cfg config.Config, run *runstate.State, conflictDetail, mergeOutput string) error {
+	pathOverride := ""
+	if cfg.Agent.PathOverrides != nil {
+		pathOverride = strings.TrimSpace(cfg.Agent.PathOverrides[cfg.Agent.Name])
+	}
+	runner, err := agent.New(cfg.Agent.Name, pathOverride)
+	if err != nil {
+		return err
+	}
+	client := gitx.Client{Dir: run.WorktreePath}
+	lastOutput := mergeOutput
+	for attempt := 1; attempt <= 5; attempt++ {
+		status, _ := client.StatusPorcelain(ctx)
+		prompt := fmt.Sprintf(`Resolve the current git merge conflicts for this PR.
+
+Original user intent:
+%s
+
+PR merge state:
+%s
+
+Merge output:
+%s
+
+Git status:
+%s
+
+Rules:
+- Resolve conflicts by preserving the original user intent and current base branch behavior.
+- Do not broaden scope.
+- Do not run git merge --continue, git merge --abort, or commit. nml will continue the merge.
+- Leave all resolved files in the worktree.`, run.Intent, conflictDetail, truncate(redact.Secrets(lastOutput), 40000), status)
+		_, err := a.withSpinnerAgent(ctx, fmt.Sprintf("resolving PR merge conflicts (attempt %d)", attempt), func() (agent.Response, error) {
+			return runner.Run(ctx, agent.Request{
+				CWD:          run.WorktreePath,
+				SystemPrompt: mutatingAgentSystemPrompt(),
+				Prompt:       prompt,
+				Expect:       agent.ExpectText,
+				Model:        cfg.Agent.Model,
+				ExtraArgs:    cfg.Agent.ExtraArgs,
+			})
+		})
+		if err != nil {
+			return err
+		}
+		if err := client.Add(ctx, nil); err != nil {
+			return err
+		}
+		out, err := continueMerge(ctx, client)
+		lastOutput = out
+		_, _ = session.WriteLog(*run, fmt.Sprintf("pr-merge-conflict-merge-continue-%d.log", attempt), redact.Secrets(out))
+		if err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("PR merge conflicts were not resolved after 5 attempts: %s", truncate(redact.Secrets(lastOutput), 4000))
+}
+
+func continueMerge(ctx context.Context, client gitx.Client) (string, error) {
+	return client.Run(ctx, "-c", "core.editor=true", "merge", "--continue")
 }
 
 func (a App) rebaseReviewBranchOntoBase(ctx context.Context, cfg config.Config, run *runstate.State, conflictDetail string) error {
@@ -2532,6 +2660,10 @@ func (a App) init(ctx context.Context, args []string) int {
 		if cancelled {
 			return a.setupCancelled()
 		}
+		cfg.ConflictResolution.Mode, cancelled = a.promptChoice(ctx, "PR conflict repair mode", config.NormalizeConflictResolutionMode(cfg.ConflictResolution.Mode), []string{"merge", "rebase"})
+		if cancelled {
+			return a.setupCancelled()
+		}
 	}
 	if root == "" {
 		cfg.Commands.Test = testCmd
@@ -2565,6 +2697,7 @@ func (a App) init(ctx context.Context, args []string) int {
 		{"review.yolo", fmt.Sprint(cfg.Review.Yolo)},
 		{"review.auto_approve_after_rounds", fmt.Sprint(cfg.Review.AutoApproveAfterRounds)},
 		{"ci.timeout", cfg.CI.Timeout},
+		{"conflict_resolution.mode", cfg.ConflictResolution.Mode},
 		{"auto_merge.enabled", fmt.Sprint(cfg.AutoMerge.Enabled)},
 		{"auto_merge.method", cfg.AutoMerge.Method},
 		{"cleanup.auto", fmt.Sprint(cfg.Cleanup.Auto)},
@@ -2750,6 +2883,7 @@ func (a App) config(ctx context.Context, args []string) int {
 			{"review.yolo", fmt.Sprint(cfg.Review.Yolo)},
 			{"review.auto_approve_after_rounds", fmt.Sprint(cfg.Review.AutoApproveAfterRounds)},
 			{"ci.timeout", cfg.CI.Timeout},
+			{"conflict_resolution.mode", cfg.ConflictResolution.Mode},
 			{"auto_merge.enabled", fmt.Sprint(cfg.AutoMerge.Enabled)},
 			{"auto_merge.method", cfg.AutoMerge.Method},
 			{"cleanup.auto", fmt.Sprint(cfg.Cleanup.Auto)},
@@ -2795,6 +2929,10 @@ func (a App) configInteractive(ctx context.Context, repoRoot string) int {
 	if cancelled {
 		return a.setupCancelled()
 	}
+	conflictResolutionMode, cancelled := a.promptChoice(ctx, "PR conflict repair mode", config.NormalizeConflictResolutionMode(cfg.ConflictResolution.Mode), []string{"merge", "rebase"})
+	if cancelled {
+		return a.setupCancelled()
+	}
 	cleanupAuto, cancelled := a.promptChoice(ctx, "Auto-cleanup treehouse worktrees", fmt.Sprint(cfg.Cleanup.Auto), []string{"true", "false"})
 	if cancelled {
 		return a.setupCancelled()
@@ -2816,6 +2954,7 @@ func (a App) configInteractive(ctx context.Context, repoRoot string) int {
 		"review.auto_approve_after_rounds": autoApproveAfterRounds,
 		"auto_merge.enabled":               autoMerge,
 		"auto_merge.method":                mergeMethod,
+		"conflict_resolution.mode":         conflictResolutionMode,
 		"cleanup.auto":                     cleanupAuto,
 		"ci.timeout":                       ciTimeout,
 		"commands.test":                    testCommand,
@@ -2834,6 +2973,7 @@ func (a App) configInteractive(ctx context.Context, repoRoot string) int {
 		{"review.auto_approve_after_rounds", autoApproveAfterRounds},
 		{"auto_merge.enabled", autoMerge},
 		{"auto_merge.method", mergeMethod},
+		{"conflict_resolution.mode", conflictResolutionMode},
 		{"cleanup.auto", cleanupAuto},
 		{"ci.timeout", ciTimeout},
 		{"commands.test", testCommand},
@@ -4475,6 +4615,7 @@ func printConfigHelp(w io.Writer) {
 	fmt.Fprintln(w, "  review.auto_approve_after_rounds=true|false")
 	fmt.Fprintln(w, "  auto_merge.enabled=true|false")
 	fmt.Fprintln(w, "  auto_merge.method=squash|merge|rebase")
+	fmt.Fprintln(w, "  conflict_resolution.mode=merge|rebase")
 	fmt.Fprintln(w, "  cleanup.auto=true|false")
 	fmt.Fprintln(w, "  ci.timeout=<duration>")
 	fmt.Fprintln(w, "  commands.test=<cmd>")
@@ -4485,6 +4626,7 @@ func printConfigHelp(w io.Writer) {
 	fmt.Fprintln(w, "  nml config --scope project --set review.yolo=true --set ci.timeout=15m")
 	fmt.Fprintln(w, "  nml config --scope project --set review.auto_approve_after_rounds=true")
 	fmt.Fprintln(w, "  nml config --scope global --set auto_merge.enabled=true")
+	fmt.Fprintln(w, "  nml config --scope project --set conflict_resolution.mode=rebase")
 	fmt.Fprintln(w, "  nml config --scope project --set cleanup.auto=false")
 	fmt.Fprintln(w, "  nml config --set-test-command \"go test ./...\"")
 }
