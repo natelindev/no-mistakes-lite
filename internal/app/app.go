@@ -1502,19 +1502,11 @@ func (a App) runCIWatch(ctx context.Context, cfg config.Config, opts runOptions,
 	maxMergeConflictFixes := 2
 	mergeConflictFixes := 0
 	for attempt := 1; attempt <= attempts; {
-		if detail, conflict, inspectErr := inspectPRMergeConflict(ctx, ghPath, run.WorktreePath, run.PRURL); inspectErr != nil {
-			a.warn("PR merge-state check failed: %v", inspectErr)
-		} else if conflict {
-			if mergeConflictFixes >= maxMergeConflictFixes {
-				run.SetStep("ci", runstate.StatusFailed, detail)
-				return fmt.Errorf("PR still has merge conflicts after %d resolution attempts: %s", mergeConflictFixes, detail)
-			}
-			mergeConflictFixes++
-			run.SetStep("ci", runstate.StatusFixing, fmt.Sprintf("attempt %d resolving PR merge conflict", mergeConflictFixes))
-			if err := a.resolvePRMergeConflict(ctx, cfg, opts, run, detail); err != nil {
-				run.SetStep("ci", runstate.StatusFailed, err.Error())
-				return err
-			}
+		resolvedConflict, conflictErr := a.resolvePRMergeConflictIfDetected(ctx, cfg, opts, run, ghPath, &mergeConflictFixes, maxMergeConflictFixes)
+		if conflictErr != nil {
+			return conflictErr
+		}
+		if resolvedConflict {
 			continue
 		}
 
@@ -1527,6 +1519,13 @@ func (a App) runCIWatch(ctx context.Context, cfg config.Config, opts runOptions,
 			return watchErr
 		})
 		_, _ = session.WriteLog(*run, fmt.Sprintf("ci-checks-attempt-%d.log", attempt), redact.Secrets(out))
+		resolvedConflict, conflictErr = a.resolvePRMergeConflictIfDetected(ctx, cfg, opts, run, ghPath, &mergeConflictFixes, maxMergeConflictFixes)
+		if conflictErr != nil {
+			return conflictErr
+		}
+		if resolvedConflict {
+			continue
+		}
 		if status == "passed" {
 			run.SetStep("ci", runstate.StatusCompleted, commandDetail("gh pr checks", out))
 			return nil
@@ -1590,6 +1589,28 @@ func (a App) runCIWatch(ctx context.Context, cfg config.Config, opts runOptions,
 		attempt++
 	}
 	return fmt.Errorf("CI did not complete")
+}
+
+func (a App) resolvePRMergeConflictIfDetected(ctx context.Context, cfg config.Config, opts runOptions, run *runstate.State, ghPath string, mergeConflictFixes *int, maxMergeConflictFixes int) (bool, error) {
+	detail, conflict, inspectErr := inspectPRMergeConflict(ctx, ghPath, run.WorktreePath, run.PRURL)
+	if inspectErr != nil {
+		a.warn("PR merge-state check failed: %v", inspectErr)
+		return false, nil
+	}
+	if !conflict {
+		return false, nil
+	}
+	if *mergeConflictFixes >= maxMergeConflictFixes {
+		run.SetStep("ci", runstate.StatusFailed, detail)
+		return false, fmt.Errorf("PR still has merge conflicts after %d resolution attempts: %s", *mergeConflictFixes, detail)
+	}
+	*mergeConflictFixes++
+	run.SetStep("ci", runstate.StatusFixing, fmt.Sprintf("attempt %d resolving PR merge conflict", *mergeConflictFixes))
+	if err := a.resolvePRMergeConflict(ctx, cfg, opts, run, detail); err != nil {
+		run.SetStep("ci", runstate.StatusFailed, err.Error())
+		return false, err
+	}
+	return true, nil
 }
 
 type prMergeState struct {

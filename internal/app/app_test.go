@@ -579,6 +579,111 @@ esac
 	}
 }
 
+func TestRunCIWatchRechecksPRMergeConflictAfterUnsuccessfulCheckWatch(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	t.Setenv("HOME", home)
+	repo := newAppTestRepo(t, filepath.Join(root, "repo"))
+	bareRemote := filepath.Join(root, "remote.git")
+	runGitAppTest(t, root, "init", "--bare", bareRemote)
+	runGitAppTest(t, repo, "remote", "add", "origin", bareRemote)
+	runGitAppTest(t, repo, "push", "origin", "main")
+	runGitAppTest(t, repo, "checkout", "-b", "nml/test")
+	if err := os.WriteFile(filepath.Join(repo, "feature.txt"), []byte("feature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAppTest(t, repo, "add", "feature.txt")
+	runGitAppTest(t, repo, "commit", "-m", "feat: add feature")
+	runGitAppTest(t, repo, "push", "origin", "nml/test")
+	runGitAppTest(t, repo, "fetch", "origin", "refs/heads/nml/test:refs/remotes/origin/nml/test")
+	runGitAppTest(t, repo, "checkout", "main")
+	if err := os.WriteFile(filepath.Join(repo, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAppTest(t, repo, "add", "base.txt")
+	runGitAppTest(t, repo, "commit", "-m", "feat: advance base")
+	runGitAppTest(t, repo, "push", "origin", "main")
+	runGitAppTest(t, repo, "checkout", "nml/test")
+
+	fakeGH := filepath.Join(root, "gh")
+	ghState := filepath.Join(root, "gh-state")
+	ghLog := filepath.Join(root, "gh.log")
+	ghScript := `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$NML_FAKE_GH_LOG"
+read_count() {
+  if [ -f "$NML_FAKE_GH_STATE" ]; then
+    cat "$NML_FAKE_GH_STATE"
+  else
+    echo 0
+  fi
+}
+case "${1:-} ${2:-}" in
+  "pr view")
+    count="$(read_count)"
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$NML_FAKE_GH_STATE"
+    if [ "$count" -eq 2 ]; then
+      printf '{"mergeStateStatus":"DIRTY","mergeable":"CONFLICTING","headRefName":"nml/test","baseRefName":"main","isDraft":false}\n'
+    else
+      printf '{"mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","headRefName":"nml/test","baseRefName":"main","isDraft":false}\n'
+    fi
+    ;;
+  "pr checks")
+    count="$(read_count)"
+    if [ "$count" -ge 3 ]; then
+      echo "All checks were successful"
+    else
+      echo "no checks reported on the branch"
+      exit 1
+    fi
+    ;;
+  *)
+    echo "unexpected gh command: $*" >&2
+    exit 2
+    ;;
+esac
+`
+	if err := os.WriteFile(fakeGH, []byte(ghScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NML_FAKE_GH_STATE", ghState)
+	t.Setenv("NML_FAKE_GH_LOG", ghLog)
+
+	cfg := config.Defaults()
+	cfg.CI.Timeout = "200ms"
+	cfg.CI.PollInterval = "1ms"
+	cfg.Commands.Test = "true"
+	cfg.Commands.Lint = "true"
+	cfg.Docs.Enabled = false
+	state := runstate.New(repo, "feature/source", "main", "origin", "abc", "origin/main")
+	state.WorktreePath = repo
+	state.ReviewBranch = "nml/test"
+	state.PRURL = "https://github.com/owner/repo/pull/1"
+	state.Intent = "add feature file"
+	var errw bytes.Buffer
+	app := App{Err: &errw, Cwd: repo, Interactive: false}
+	if err := app.runCIWatch(context.Background(), cfg, runOptions{SkipReview: true}, &state, fakeGH); err != nil {
+		t.Fatalf("runCIWatch returned error: %v\nstderr:\n%s", err, errw.String())
+	}
+	if got := appTestStepStatus(state, "ci"); got != runstate.StatusCompleted {
+		t.Fatalf("ci status = %s, want completed", got)
+	}
+	if _, err := (gitx.Client{Dir: repo}).Run(context.Background(), "merge-base", "--is-ancestor", "origin/main", "HEAD"); err != nil {
+		t.Fatalf("review branch did not include origin/main after late conflict repair: %v", err)
+	}
+	logData, err := os.ReadFile(ghLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if views := strings.Count(string(logData), "pr view"); views < 3 {
+		t.Fatalf("expected PR merge state to be checked again after unsuccessful CI watch, gh log:\n%s", logData)
+	}
+	if checks := strings.Count(string(logData), "pr checks"); checks < 2 {
+		t.Fatalf("expected CI checks to be watched again after conflict resolution, gh log:\n%s", logData)
+	}
+}
+
 func TestResolvePRMergeConflictCanRebaseWhenConfigured(t *testing.T) {
 	root := t.TempDir()
 	home := filepath.Join(root, "home")

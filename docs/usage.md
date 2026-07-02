@@ -38,8 +38,8 @@ preflight -> intent -> commit -> worktree -> review -> test -> docs -> lint -> p
 - Set `review.auto_approve_after_rounds=true` to continue after the configured review rounds even when auto-fix attempts still leave findings.
 - Pass `--skip-review` to mark the review step skipped without invoking the configured agent or built-in review checks.
 - Tests, docs, lint, CI, and deploy can ask the configured agent for fixes. PR bodies summarize only each command and final status, not full command output.
-- Before waiting on CI, nml checks the PR merge state. If GitHub reports merge conflicts, nml repairs the review branch with `conflict_resolution.mode` (`merge` by default, or `rebase`), asks the configured agent to resolve local conflicts when needed, re-runs validation, force-pushes, and then watches checks again.
-- If GitHub initially reports no PR checks, nml waits briefly for checks to register before deciding there are no checks. Runs that use `--yolo`, explicitly skip review, or auto-approve unresolved review findings require reported CI checks and fail if none appear.
+- `nml` checks PR merge state before and after CI watches. If GitHub reports merge conflicts, nml repairs the review branch with `conflict_resolution.mode` (`merge` by default, or `rebase`), asks the configured agent to resolve local conflicts when needed, re-runs validation, force-pushes, and then watches checks again.
+- If GitHub initially reports no PR checks, nml waits briefly for checks to register before deciding there are no checks. Runs that use `--yolo`, explicitly skip review, or auto-approve unresolved review findings require reported CI checks and fail if none appear after any detected PR merge conflicts are repaired.
 - Completed runs print a compact summary with PR URL, cleanup status, and step statuses. Use `nml status --run <id>` or `nml status --run <id> --full` for step details and logs.
 - Auto-merge means nml runs `gh pr merge` after checks pass. It does not use GitHub's repository-level auto-merge feature. GitHub CLI prompts are disabled, so nml fails with saved state instead of waiting for terminal input.
 - Cleanup auto-return is enabled by default. After a completed run, nml returns the Treehouse worktree with `treehouse return --force`. If the current terminal started inside that worktree, nml keeps it so the parent shell is not left in a removed directory. Set `cleanup.auto=false` to keep completed worktrees for inspection.
@@ -56,7 +56,7 @@ nml resume
 nml resume --run <id>
 ```
 
-`nml resume` continues the latest failed or interrupted run. It reuses the leased worktree, reuses or updates the existing PR, resolves detected PR merge conflicts before CI, pushes local CI-fix commits that are ahead of the remote review branch, and then resumes the remaining validation steps. If the run is stopped at a review gate, resume prints the gate instead of making an approval decision. Use `nml resume --skip-review --run <id>` to bypass a pending or failed review phase and continue with validation.
+`nml resume` continues the latest failed or interrupted run. It reuses the leased worktree, reuses or updates the existing PR, resolves detected PR merge conflicts before or after CI watches, pushes local CI-fix commits that are ahead of the remote review branch, and then resumes the remaining validation steps. If the run is stopped at a review gate, resume prints the gate instead of making an approval decision. Use `nml resume --skip-review --run <id>` to bypass a pending or failed review phase and continue with validation.
 
 ## Review gates
 
